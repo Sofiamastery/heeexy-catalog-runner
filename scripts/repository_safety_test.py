@@ -158,6 +158,7 @@ class PublicRepositorySafetyTests(unittest.TestCase):
             "AI_PNG_METADATA_JSONL_NAME",
             "AI_PNG_METADATA_JSONL_SHA256",
             "SITE_BASE_URL",
+            "CATALOG_INGEST_SECRET",
             "GOOGLE_DRIVE_OAUTH_CLIENT_ID",
             "GOOGLE_DRIVE_OAUTH_CLIENT_SECRET",
             "GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN",
@@ -165,7 +166,7 @@ class PublicRepositorySafetyTests(unittest.TestCase):
         for name in secret_names:
             self.assertIn(f"${{{{ secrets.{name} }}}}", workflow)
 
-    def test_ingest_uses_short_lived_oidc_without_a_static_ingest_secret(self) -> None:
+    def test_ingest_keeps_oidc_default_and_allows_a_masked_static_fallback(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         pipeline = (ROOT / "scripts" / "cloud_catalog_pipeline.py").read_text(
             encoding="utf-8"
@@ -174,10 +175,14 @@ class PublicRepositorySafetyTests(unittest.TestCase):
         self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", workflow)
         self.assertIn('oidc_audience="heeexy-catalog-ingest"', workflow)
         self.assertIn("@uri", workflow)
-        legacy_secret_name = "CATALOG_" + "INGEST_SECRET"
-        self.assertNotIn(legacy_secret_name, workflow)
-        self.assertNotIn(legacy_secret_name, pipeline)
+        self.assertIn("CATALOG_INGEST_SECRET", workflow)
+        self.assertIn("CATALOG_INGEST_SECRET", pipeline)
+        self.assertIn('if [[ -z "${CATALOG_INGEST_SECRET:-}" ]]', workflow)
+        self.assertNotIn("add-mask::${CATALOG_INGEST_SECRET}", workflow)
+        self.assertNotIn('echo "$CATALOG_INGEST_SECRET"', workflow)
         self.assertIn('"X-GitHub-OIDC-Token"', pipeline)
+        self.assertIn('"Authorization"', pipeline)
+        self.assertIn("validated_ingest_secret", pipeline)
 
     def test_metadata_job_is_read_only_and_manifest_identity_is_not_exported(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

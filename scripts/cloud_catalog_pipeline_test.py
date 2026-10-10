@@ -23,6 +23,7 @@ from cloud_catalog_pipeline import (  # noqa: E402
     DRIVE_RESUMABLE_RETRY_DELAYS,
     DriveClient,
     GitHubOidcTokenProvider,
+    StaticIngestSecretProvider,
     MAX_ARCHIVE_ENTRIES,
     WHITE,
     PipelineError,
@@ -31,6 +32,7 @@ from cloud_catalog_pipeline import (  # noqa: E402
     candidate_from_record,
     candidate_from_sidecar,
     classify_drive_error,
+    build_ingest_auth_provider,
     create_previews,
     discover_png_only_candidates,
     drive_binary_metadata_matches,
@@ -48,6 +50,7 @@ from cloud_catalog_pipeline import (  # noqa: E402
     validate_delivery_zip_archive,
     validate_ingest_response_payload,
     validated_ingest_oidc_token,
+    validated_ingest_secret,
     unverified_oidc_expiry,
     validate_svg_bytes,
     visible_content_bounds,
@@ -697,7 +700,9 @@ class CloudCatalogPipelineTests(unittest.TestCase):
     def test_ingest_authentication_accepts_only_jwt_shaped_oidc_tokens(self):
         token = f"{'a' * 24}.{'b' * 48}.{'c' * 32}"
         self.assertEqual(validated_ingest_oidc_token(token), token)
-        self.assertEqual(ingest_auth_headers(token), {"X-GitHub-OIDC-Token": token})
+        self.assertEqual(
+            ingest_auth_headers(oidc_token=token), {"X-GitHub-OIDC-Token": token}
+        )
         invalid_tokens = (
             "",
             "static-secret",
@@ -710,6 +715,59 @@ class CloudCatalogPipelineTests(unittest.TestCase):
                     PipelineError, "catalog_ingest_oidc_token_invalid"
                 ):
                     validated_ingest_oidc_token(invalid)
+
+    def test_static_ingest_fallback_rejects_weak_secrets(self):
+        weak_values = (
+            "",
+            "too-short",
+            "A" * 64,
+            hashlib.sha256(b"valid-shape-but-surrounded").hexdigest() + " ",
+            "abc123_-" * 65,
+        )
+        for index, weak in enumerate(weak_values):
+            with self.subTest(case=index):
+                with self.assertRaisesRegex(
+                    PipelineError, "catalog_ingest_secret_invalid"
+                ):
+                    validated_ingest_secret(weak)
+
+    def test_static_ingest_fallback_selects_bearer_without_printing_values(self):
+        secret = hashlib.sha256(b"deterministic-test-only-ingest-secret").hexdigest()
+        oidc_token = f"{'a' * 24}.{'b' * 48}.{'c' * 32}"
+        with mock.patch("builtins.print") as print_mock:
+            provider = build_ingest_auth_provider(
+                {
+                    "CATALOG_INGEST_SECRET": secret,
+                    "GITHUB_ACTIONS_OIDC_TOKEN": oidc_token,
+                }
+            )
+            headers = ingest_auth_headers(
+                oidc_token=oidc_token,
+                ingest_secret=secret,
+            )
+        print_mock.assert_not_called()
+        self.assertIsInstance(provider, StaticIngestSecretProvider)
+        self.assertEqual(set(headers), {"Authorization"})
+        self.assertTrue(headers["Authorization"].startswith("Bearer "))
+
+    def test_oidc_remains_default_when_static_fallback_is_absent(self):
+        def encode(value):
+            return base64.urlsafe_b64encode(
+                json.dumps(value, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+
+        oidc_token = (
+            f"{encode({'alg': 'RS256', 'typ': 'JWT'})}."
+            f"{encode({'exp': 2_000_000_000})}.{'s' * 32}"
+        )
+        with mock.patch("builtins.print") as print_mock:
+            provider = build_ingest_auth_provider(
+                {"GITHUB_ACTIONS_OIDC_TOKEN": oidc_token}
+            )
+            headers = ingest_auth_headers(oidc_token=oidc_token)
+        print_mock.assert_not_called()
+        self.assertIsInstance(provider, GitHubOidcTokenProvider)
+        self.assertEqual(set(headers), {"X-GitHub-OIDC-Token"})
 
     def test_long_batch_refreshes_expiring_oidc_token_in_memory(self):
         def encode(value):

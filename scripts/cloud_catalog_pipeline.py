@@ -86,6 +86,8 @@ OIDC_JWT_RE = re.compile(
 OIDC_AUDIENCE = "heeexy-catalog-ingest"
 OIDC_REFRESH_SKEW_SECONDS = 120
 OIDC_REQUEST_HOST_SUFFIX = ".actions.githubusercontent.com"
+INGEST_SECRET_RE = re.compile(r"^[A-Za-z0-9._~+/=\-]{43,512}$")
+INGEST_SECRET_MIN_DISTINCT_CHARS = 8
 SAFE_NAME_RE = re.compile(r"[^a-z0-9]+")
 DRIVE_FILE_FIELDS = (
     "id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,version,"
@@ -375,13 +377,23 @@ class GitHubOidcTokenProvider:
 
 
 @dataclass(frozen=True)
+class StaticIngestSecretProvider:
+    """Return a validated static fallback header without logging its value."""
+
+    secret_value: str
+
+    def current_headers(self, _http_client: Any) -> dict[str, str]:
+        return ingest_auth_headers(ingest_secret=self.secret_value)
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     manifest_file_id: str | None
     png_only_root_id: str | None
     product_zips_folder_id: str
     reports_folder_id: str
     site_base_url: str
-    ingest_oidc_provider: GitHubOidcTokenProvider
+    ingest_auth_provider: GitHubOidcTokenProvider | StaticIngestSecretProvider
     batch_size: int
     retry_holds: bool
     runner_temp: Path
@@ -1790,8 +1802,12 @@ def post_ingest(
             ):
                 response = requests.post(
                     endpoint,
-                    headers=ingest_auth_headers(
-                        config.ingest_oidc_provider.current_token(requests)
+                    headers=(
+                        ingest_auth_headers(
+                            oidc_token=config.ingest_auth_provider.current_token(requests)
+                        )
+                        if isinstance(config.ingest_auth_provider, GitHubOidcTokenProvider)
+                        else config.ingest_auth_provider.current_headers(requests)
                     ),
                     files={
                         "manifest": ("manifest.json", manifest_bytes, "application/json"),
@@ -2077,8 +2093,36 @@ def unverified_oidc_expiry(token: str) -> int:
     return expiry
 
 
-def ingest_auth_headers(token: str) -> dict[str, str]:
-    return {"X-GitHub-OIDC-Token": validated_ingest_oidc_token(token)}
+def validated_ingest_secret(value: str) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise PipelineError("catalog_ingest_secret_invalid")
+    if (
+        not INGEST_SECRET_RE.fullmatch(value)
+        or len(set(value)) < INGEST_SECRET_MIN_DISTINCT_CHARS
+    ):
+        raise PipelineError("catalog_ingest_secret_invalid")
+    return value
+
+
+def ingest_auth_headers(
+    *, oidc_token: str = "", ingest_secret: str = ""
+) -> dict[str, str]:
+    if ingest_secret:
+        return {"Authorization": f"Bearer {validated_ingest_secret(ingest_secret)}"}
+    return {"X-GitHub-OIDC-Token": validated_ingest_oidc_token(oidc_token)}
+
+
+def build_ingest_auth_provider(
+    environment: Mapping[str, str],
+) -> GitHubOidcTokenProvider | StaticIngestSecretProvider:
+    ingest_secret = environment.get("CATALOG_INGEST_SECRET", "")
+    if ingest_secret:
+        return StaticIngestSecretProvider(validated_ingest_secret(ingest_secret))
+    ingest_oidc_token = validated_ingest_oidc_token(
+        environment.get("GITHUB_ACTIONS_OIDC_TOKEN", "")
+    )
+    unverified_oidc_expiry(ingest_oidc_token)
+    return GitHubOidcTokenProvider(ingest_oidc_token)
 
 
 def require_drive_id(value: str, code: str) -> str:
@@ -2104,10 +2148,7 @@ def load_config(arguments: argparse.Namespace, runner_temp: Path) -> tuple[Pipel
         os.environ.get("HEEEXY_REPORTS_FOLDER_ID", "").strip(),
         "reports_folder_id_invalid",
     )
-    ingest_oidc_token = validated_ingest_oidc_token(
-        os.environ.get("GITHUB_ACTIONS_OIDC_TOKEN", "")
-    )
-    unverified_oidc_expiry(ingest_oidc_token)
+    ingest_auth_provider = build_ingest_auth_provider(os.environ)
     oauth = (
         os.environ.get("GOOGLE_DRIVE_OAUTH_CLIENT_ID", "").strip(),
         os.environ.get("GOOGLE_DRIVE_OAUTH_CLIENT_SECRET", "").strip(),
@@ -2124,7 +2165,7 @@ def load_config(arguments: argparse.Namespace, runner_temp: Path) -> tuple[Pipel
             site_base_url=normalized_site_base_url(
                 os.environ.get("HEEEXY_SITE_BASE_URL", "")
             ),
-            ingest_oidc_provider=GitHubOidcTokenProvider(ingest_oidc_token),
+            ingest_auth_provider=ingest_auth_provider,
             batch_size=arguments.batch_size,
             retry_holds=arguments.retry_holds,
             runner_temp=runner_temp,

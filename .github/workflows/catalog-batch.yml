@@ -349,6 +349,7 @@ jobs:
           HEEEXY_PRODUCT_ZIPS_FOLDER_ID: ${{ secrets.PRODUCT_ZIPS_FOLDER_ID }}
           HEEEXY_REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
           HEEEXY_SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          CATALOG_INGEST_SECRET: ${{ secrets.CATALOG_INGEST_SECRET }}
           GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
           GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
           GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
@@ -362,33 +363,36 @@ jobs:
           summary_file="${RUNNER_TEMP}/catalog-pipeline-summary.txt"
           trap 'rm -f "$summary_file"' EXIT
 
-          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}"
-          separator="?"
-          if [[ "$oidc_url" == *"?"* ]]; then
-            separator="&"
+          oidc_token=""
+          if [[ -z "${CATALOG_INGEST_SECRET:-}" ]]; then
+            oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}"
+            separator="?"
+            if [[ "$oidc_url" == *"?"* ]]; then
+              separator="&"
+            fi
+            oidc_audience="heeexy-catalog-ingest"
+            oidc_audience_encoded="$(jq -nr --arg value "$oidc_audience" '$value | @uri')"
+            if ! oidc_response="$(curl --fail --silent \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${oidc_url}${separator}audience=${oidc_audience_encoded}")"; then
+              echo "::error::GitHub OIDC token request failed."
+              exit 1
+            fi
+            if ! oidc_token="$(printf '%s' "$oidc_response" | jq -er \
+              '.value | select(type == "string" and length > 0)')"; then
+              echo "::error::GitHub OIDC response was invalid."
+              exit 1
+            fi
+            unset oidc_response
+            echo "::add-mask::${oidc_token}"
+            export GITHUB_ACTIONS_OIDC_TOKEN="$oidc_token"
           fi
-          oidc_audience="heeexy-catalog-ingest"
-          oidc_audience_encoded="$(jq -nr --arg value "$oidc_audience" '$value | @uri')"
-          if ! oidc_response="$(curl --fail --silent \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${oidc_url}${separator}audience=${oidc_audience_encoded}")"; then
-            echo "::error::GitHub OIDC token request failed."
-            exit 1
-          fi
-          if ! oidc_token="$(printf '%s' "$oidc_response" | jq -er \
-            '.value | select(type == "string" and length > 0)')"; then
-            echo "::error::GitHub OIDC response was invalid."
-            exit 1
-          fi
-          unset oidc_response
-          echo "::add-mask::${oidc_token}"
 
-          if ! GITHUB_ACTIONS_OIDC_TOKEN="$oidc_token" \
-            python -B scripts/cloud_catalog_pipeline.py "${args[@]}" > "$summary_file"; then
+          if ! python -B scripts/cloud_catalog_pipeline.py "${args[@]}" > "$summary_file"; then
             echo "::error::Catalog batch failed with a sanitized pipeline error."
             exit 1
           fi
-          unset oidc_token
+          unset oidc_token GITHUB_ACTIONS_OIDC_TOKEN
           python -B scripts/cloud_catalog_batch_summary.py \
             --summary-file "$summary_file" \
             --github-output "$GITHUB_OUTPUT" \
