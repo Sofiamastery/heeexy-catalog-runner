@@ -1,0 +1,442 @@
+name: Private catalog batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: Products to process on this fresh hosted runner
+        required: true
+        type: choice
+        options:
+          - "25"
+          - "50"
+          - "100"
+          - "250"
+          - "500"
+        default: "50"
+      retry_holds:
+        description: Retry unchanged products that are already on hold
+        required: true
+        type: boolean
+        default: false
+      rebuild_manifest:
+        description: Refresh the private metadata-only Drive manifest before ingest
+        required: true
+        type: boolean
+        default: true
+      drain_catalog:
+        description: Dispatch another bounded batch while the current batch remains full
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    # Scheduled runs process one bounded batch. They are inert unless the
+    # SCHEDULE_ENABLED environment secret is exactly "true".
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-catalog-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  manifest:
+    name: Refresh private metadata-only manifest
+    if: >-
+      ${{ github.ref == 'refs/heads/main' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: production-catalog
+    permissions:
+      contents: read
+    outputs:
+      workflow_enabled: ${{ steps.authorize.outputs.workflow_enabled }}
+      should_rebuild: ${{ steps.authorize.outputs.should_rebuild }}
+    env:
+      CI: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PIP_NO_CACHE_DIR: "1"
+    steps:
+      - name: Authorize metadata refresh
+        id: authorize
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ secrets.EXPECTED_REPOSITORY }}
+          SCHEDULE_ENABLED: ${{ secrets.SCHEDULE_ENABLED }}
+          ACTIONS_RETENTION_DAYS: ${{ secrets.ACTIONS_RETENTION_DAYS }}
+          CATALOG_MANIFEST_DRIVE_FILE_ID: ${{ secrets.CATALOG_MANIFEST_DRIVE_FILE_ID }}
+          METADATA_IMPORT_FOLDER_ID: ${{ secrets.METADATA_IMPORT_FOLDER_ID }}
+          CATALOG_METADATA_FOLDER_ID: ${{ secrets.CATALOG_METADATA_FOLDER_ID }}
+          REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
+          F16_ROOT_FOLDER_ID: ${{ secrets.F16_ROOT_FOLDER_ID }}
+          PNG_ONLY_ROOT_FOLDER_ID: ${{ secrets.PNG_ONLY_ROOT_FOLDER_ID }}
+          EXPECTED_MIN_PRODUCT_COUNT: ${{ secrets.EXPECTED_MIN_PRODUCT_COUNT }}
+          EXPECTED_MIN_ACCEPTED_COUNT: ${{ secrets.EXPECTED_MIN_ACCEPTED_COUNT }}
+          CATALOG_SOURCE_NAMESPACE: ${{ secrets.CATALOG_SOURCE_NAMESPACE }}
+          DREAMSTIME_LEDGER_ZIP_DRIVE_FILE_ID: ${{ secrets.DREAMSTIME_LEDGER_ZIP_DRIVE_FILE_ID }}
+          DREAMSTIME_LEDGER_ZIP_NAME: ${{ secrets.DREAMSTIME_LEDGER_ZIP_NAME }}
+          DREAMSTIME_LEDGER_ZIP_SHA256: ${{ secrets.DREAMSTIME_LEDGER_ZIP_SHA256 }}
+          DREAMSTIME_LEDGER_MEMBER_SHA256: ${{ secrets.DREAMSTIME_LEDGER_MEMBER_SHA256 }}
+          AI_PNG_METADATA_JSONL_DRIVE_FILE_ID: ${{ secrets.AI_PNG_METADATA_JSONL_DRIVE_FILE_ID }}
+          AI_PNG_METADATA_JSONL_NAME: ${{ secrets.AI_PNG_METADATA_JSONL_NAME }}
+          AI_PNG_METADATA_JSONL_SHA256: ${{ secrets.AI_PNG_METADATA_JSONL_SHA256 }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$EXPECTED_REPOSITORY" || "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+            echo "::error::This workflow is not authorized for this repository."
+            exit 2
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Catalog metadata may refresh only from main."
+            exit 2
+          fi
+          if [[ "$ACTIONS_RETENTION_DAYS" != "1" ]]; then
+            echo "::error::Set Actions log/artifact retention to one day and attest it with ACTIONS_RETENTION_DAYS=1."
+            exit 2
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$SCHEDULE_ENABLED" != "true" ]]; then
+            echo "Scheduled catalog processing is disabled."
+            echo "workflow_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "should_rebuild=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "workflow_enabled=true" >> "$GITHUB_OUTPUT"
+          should_rebuild="false"
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" || "${{ inputs.rebuild_manifest }}" == "true" ]]; then
+            should_rebuild="true"
+          fi
+          echo "should_rebuild=${should_rebuild}" >> "$GITHUB_OUTPUT"
+          if [[ "$should_rebuild" != "true" ]]; then
+            exit 0
+          fi
+
+          required=(
+            CATALOG_MANIFEST_DRIVE_FILE_ID
+            METADATA_IMPORT_FOLDER_ID
+            CATALOG_METADATA_FOLDER_ID
+            REPORTS_FOLDER_ID
+            F16_ROOT_FOLDER_ID
+            PNG_ONLY_ROOT_FOLDER_ID
+            EXPECTED_MIN_PRODUCT_COUNT
+            EXPECTED_MIN_ACCEPTED_COUNT
+            CATALOG_SOURCE_NAMESPACE
+            DREAMSTIME_LEDGER_ZIP_DRIVE_FILE_ID
+            DREAMSTIME_LEDGER_ZIP_NAME
+            DREAMSTIME_LEDGER_ZIP_SHA256
+            DREAMSTIME_LEDGER_MEMBER_SHA256
+            AI_PNG_METADATA_JSONL_DRIVE_FILE_ID
+            AI_PNG_METADATA_JSONL_NAME
+            AI_PNG_METADATA_JSONL_SHA256
+            GOOGLE_DRIVE_OAUTH_CLIENT_ID
+            GOOGLE_DRIVE_OAUTH_CLIENT_SECRET
+            GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN
+          )
+          for secret_name in "${required[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::Required production-catalog environment secret is missing: ${secret_name}."
+              exit 2
+            fi
+          done
+
+      - name: Check out the reviewed metadata runner
+        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python for metadata refresh
+        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Install metadata-only runtime
+        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+
+      - name: Run metadata and no-loss unit tests
+        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B -m unittest \
+            scripts/cloud_catalog_manifest_test.py \
+            scripts/cloud_catalog_report_summary_test.py
+
+      - name: Refresh the private manifest in Drive
+        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: github-hosted
+          HEEEXY_CATALOG_MANIFEST_DRIVE_FILE_ID: ${{ secrets.CATALOG_MANIFEST_DRIVE_FILE_ID }}
+          HEEEXY_METADATA_IMPORT_FOLDER_ID: ${{ secrets.METADATA_IMPORT_FOLDER_ID }}
+          HEEEXY_CATALOG_METADATA_FOLDER_ID: ${{ secrets.CATALOG_METADATA_FOLDER_ID }}
+          HEEEXY_REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
+          HEEEXY_F16_ROOT_FOLDER_ID: ${{ secrets.F16_ROOT_FOLDER_ID }}
+          HEEEXY_PNG_ONLY_ROOT_FOLDER_ID: ${{ secrets.PNG_ONLY_ROOT_FOLDER_ID }}
+          HEEEXY_EXPECTED_MIN_PRODUCT_COUNT: ${{ secrets.EXPECTED_MIN_PRODUCT_COUNT }}
+          HEEEXY_EXPECTED_MIN_ACCEPTED_COUNT: ${{ secrets.EXPECTED_MIN_ACCEPTED_COUNT }}
+          HEEEXY_CATALOG_SOURCE_NAMESPACE: ${{ secrets.CATALOG_SOURCE_NAMESPACE }}
+          HEEEXY_DREAMSTIME_LEDGER_ZIP_DRIVE_FILE_ID: ${{ secrets.DREAMSTIME_LEDGER_ZIP_DRIVE_FILE_ID }}
+          HEEEXY_DREAMSTIME_LEDGER_ZIP_NAME: ${{ secrets.DREAMSTIME_LEDGER_ZIP_NAME }}
+          HEEEXY_DREAMSTIME_LEDGER_ZIP_SHA256: ${{ secrets.DREAMSTIME_LEDGER_ZIP_SHA256 }}
+          HEEEXY_DREAMSTIME_LEDGER_MEMBER_SHA256: ${{ secrets.DREAMSTIME_LEDGER_MEMBER_SHA256 }}
+          HEEEXY_AI_PNG_METADATA_JSONL_DRIVE_FILE_ID: ${{ secrets.AI_PNG_METADATA_JSONL_DRIVE_FILE_ID }}
+          HEEEXY_AI_PNG_METADATA_JSONL_NAME: ${{ secrets.AI_PNG_METADATA_JSONL_NAME }}
+          HEEEXY_AI_PNG_METADATA_JSONL_SHA256: ${{ secrets.AI_PNG_METADATA_JSONL_SHA256 }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -B scripts/cloud_catalog_manifest.py
+
+      - name: Verify the private publication report without exposing its contents
+        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: github-hosted
+          HEEEXY_REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -B scripts/cloud_catalog_report_summary.py
+
+  ingest:
+    needs: manifest
+    if: >-
+      ${{ needs.manifest.result == 'success' &&
+          needs.manifest.outputs.workflow_enabled == 'true' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    environment: production-catalog
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      selected: ${{ steps.process_batch.outputs.selected }}
+      batch_size: ${{ steps.process_batch.outputs.batch_size }}
+      batch_full: ${{ steps.process_batch.outputs.batch_full }}
+    env:
+      CI: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PIP_NO_CACHE_DIR: "1"
+      BATCH_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_size || secrets.DEFAULT_BATCH_SIZE }}
+      RETRY_HOLDS: ${{ github.event_name == 'workflow_dispatch' && inputs.retry_holds || false }}
+    steps:
+      - name: Authorize this repository and run
+        id: authorize
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ secrets.EXPECTED_REPOSITORY }}
+          SCHEDULE_ENABLED: ${{ secrets.SCHEDULE_ENABLED }}
+          ACTIONS_RETENTION_DAYS: ${{ secrets.ACTIONS_RETENTION_DAYS }}
+          CATALOG_MANIFEST_DRIVE_FILE_ID: ${{ secrets.CATALOG_MANIFEST_DRIVE_FILE_ID }}
+          PRODUCT_ZIPS_FOLDER_ID: ${{ secrets.PRODUCT_ZIPS_FOLDER_ID }}
+          REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+          DEFAULT_BATCH_SIZE: ${{ secrets.DEFAULT_BATCH_SIZE }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" || -z "$EXPECTED_REPOSITORY" ]]; then
+            echo "::error::This workflow is not authorized for this repository."
+            exit 2
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Catalog batches may run only from main."
+            exit 2
+          fi
+          if [[ "$ACTIONS_RETENTION_DAYS" != "1" ]]; then
+            echo "::error::Set Actions log/artifact retention to one day and attest it with ACTIONS_RETENTION_DAYS=1."
+            exit 2
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$SCHEDULE_ENABLED" != "true" ]]; then
+            echo "Scheduled catalog processing is disabled."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          required=(
+            CATALOG_MANIFEST_DRIVE_FILE_ID
+            PRODUCT_ZIPS_FOLDER_ID
+            REPORTS_FOLDER_ID
+            SITE_BASE_URL
+            GOOGLE_DRIVE_OAUTH_CLIENT_ID
+            GOOGLE_DRIVE_OAUTH_CLIENT_SECRET
+            GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN
+            DEFAULT_BATCH_SIZE
+          )
+          for secret_name in "${required[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::Required production-catalog environment secret is missing: ${secret_name}."
+              exit 2
+            fi
+          done
+          if [[ ! "$BATCH_SIZE" =~ ^(25|50|100|250|500)$ ]]; then
+            echo "::error::The selected batch size is not allowlisted."
+            exit 2
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the reviewed runner source
+        if: ${{ steps.authorize.outputs.should_run == 'true' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        if: ${{ steps.authorize.outputs.should_run == 'true' }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Install the ephemeral Python runtime
+        if: ${{ steps.authorize.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+
+      - name: Install the ephemeral SVG renderer
+        if: ${{ steps.authorize.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends librsvg2-bin
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Run unit and repository-safety tests
+        if: ${{ steps.authorize.outputs.should_run == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B -m unittest \
+            scripts/cloud_catalog_pipeline_test.py \
+            scripts/cloud_catalog_batch_summary_test.py \
+            scripts/repository_safety_test.py
+
+      - name: Process one private manifest-index batch
+        id: process_batch
+        if: ${{ steps.authorize.outputs.should_run == 'true' }}
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: github-hosted
+          HEEEXY_CATALOG_MANIFEST_DRIVE_FILE_ID: ${{ secrets.CATALOG_MANIFEST_DRIVE_FILE_ID }}
+          HEEEXY_PRODUCT_ZIPS_FOLDER_ID: ${{ secrets.PRODUCT_ZIPS_FOLDER_ID }}
+          HEEEXY_REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
+          HEEEXY_SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--batch-size "$BATCH_SIZE")
+          if [[ "$RETRY_HOLDS" == "true" ]]; then
+            args+=(--retry-holds)
+          fi
+
+          summary_file="${RUNNER_TEMP}/catalog-pipeline-summary.txt"
+          trap 'rm -f "$summary_file"' EXIT
+
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}"
+          separator="?"
+          if [[ "$oidc_url" == *"?"* ]]; then
+            separator="&"
+          fi
+          oidc_audience="heeexy-catalog-ingest"
+          oidc_audience_encoded="$(jq -nr --arg value "$oidc_audience" '$value | @uri')"
+          if ! oidc_response="$(curl --fail --silent \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${oidc_url}${separator}audience=${oidc_audience_encoded}")"; then
+            echo "::error::GitHub OIDC token request failed."
+            exit 1
+          fi
+          if ! oidc_token="$(printf '%s' "$oidc_response" | jq -er \
+            '.value | select(type == "string" and length > 0)')"; then
+            echo "::error::GitHub OIDC response was invalid."
+            exit 1
+          fi
+          unset oidc_response
+          echo "::add-mask::${oidc_token}"
+
+          if ! GITHUB_ACTIONS_OIDC_TOKEN="$oidc_token" \
+            python -B scripts/cloud_catalog_pipeline.py "${args[@]}" > "$summary_file"; then
+            echo "::error::Catalog batch failed with a sanitized pipeline error."
+            exit 1
+          fi
+          unset oidc_token
+          python -B scripts/cloud_catalog_batch_summary.py \
+            --summary-file "$summary_file" \
+            --github-output "$GITHUB_OUTPUT" \
+            --batch-size "$BATCH_SIZE"
+
+  continue_catalog:
+    name: Continue bounded cloud drain
+    needs: ingest
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          github.ref == 'refs/heads/main' &&
+          inputs.drain_catalog == true &&
+          needs.ingest.result == 'success' &&
+          needs.ingest.outputs.batch_full == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the next bounded batch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SAFE_BATCH_SIZE: ${{ needs.ingest.outputs.batch_size }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" || -z "$GH_REPO" ]]; then
+            echo "::error::Continuation is not authorized from this ref."
+            exit 2
+          fi
+          if [[ ! "$SAFE_BATCH_SIZE" =~ ^(25|50|100|250|500)$ ]]; then
+            echo "::error::Continuation received an invalid batch size."
+            exit 2
+          fi
+
+          workflow_file="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
+          workflow_file="${workflow_file%@*}"
+          payload="$(jq -cn --arg batch "$SAFE_BATCH_SIZE" '{
+            ref: "main",
+            inputs: {
+              batch_size: $batch,
+              retry_holds: "false",
+              rebuild_manifest: "false",
+              drain_catalog: "true"
+            }
+          }')"
+          gh api \
+            --method POST \
+            "repos/${GH_REPO}/actions/workflows/${workflow_file}/dispatches" \
+            --input - <<<"$payload" >/dev/null
