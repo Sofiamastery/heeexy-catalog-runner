@@ -192,10 +192,11 @@ PUBLIC_AI_DESCRIPTION_SUFFIX_RE = re.compile(
 class PipelineError(RuntimeError):
     """Sanitized failure carrying a stable non-sensitive code."""
 
-    def __init__(self, code: str, *, permanent: bool = False):
+    def __init__(self, code: str, *, permanent: bool = False, diagnostic: str = ""):
         super().__init__(code)
         self.code = code
         self.permanent = permanent
+        self.diagnostic = diagnostic
 
 
 def _drive_http_details(error: BaseException) -> tuple[int | None, frozenset[str]]:
@@ -241,17 +242,24 @@ def classify_drive_error(
     """Separate per-file permanent failures from service/authentication stops."""
 
     status, reasons = _drive_http_details(error)
+    # Public runner logs may contain only bounded status and known reason tokens,
+    # never provider messages, URLs, identities, or arbitrary response values.
+    safe_status = str(status) if status is not None and 100 <= status <= 599 else "none"
+    known_reasons = sorted(reasons.intersection(
+        OAUTH_DRIVE_REASONS | TRANSIENT_DRIVE_REASONS | HARD_DRIVE_REASONS
+    ))
+    diagnostic = f"drive_http={safe_status} drive_reason={','.join(known_reasons) or 'unknown'}"
     if status == 401 or reasons.intersection(OAUTH_DRIVE_REASONS):
-        return PipelineError("drive_oauth_failed")
+        return PipelineError("drive_oauth_failed", diagnostic=diagnostic)
     if (
         status in {408, 425, 429}
         or (status is not None and status >= 500)
         or reasons.intersection(TRANSIENT_DRIVE_REASONS)
     ):
-        return PipelineError(code)
+        return PipelineError(code, diagnostic=diagnostic)
     if candidate_scoped and status in {403, 404, 410}:
-        return PipelineError(code, permanent=True)
-    return PipelineError(code)
+        return PipelineError(code, permanent=True, diagnostic=diagnostic)
+    return PipelineError(code, diagnostic=diagnostic)
 
 
 def drive_error_is_retryable(error: BaseException) -> bool:
@@ -2329,7 +2337,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"pipeline_status=ok {safe_summary(stats)}", flush=True)
         return 0
     except PipelineError as error:
-        print(f"pipeline_status=failed code={error.code}", file=sys.stderr, flush=True)
+        detail = f" {error.diagnostic}" if error.diagnostic else ""
+        print(f"pipeline_status=failed code={error.code}{detail}", file=sys.stderr, flush=True)
         return 2
     except Exception:
         # Never print exception strings: Drive/HTTP libraries can embed URLs,

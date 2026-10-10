@@ -83,6 +83,23 @@ def whitelist_record(**overrides):
 
 
 class CloudCatalogPipelineTests(unittest.TestCase):
+    def test_drive_diagnostics_expose_only_allowlisted_status_and_reasons(self):
+        error = RuntimeError("secret-token and private-file-url must never appear")
+        error.resp = type("Response", (), {"status": 403})()
+        error.content = json.dumps({"error": {"message": "secret-token", "errors": [
+            {"reason": "storageQuotaExceeded"}, {"reason": "private-file-url"}
+        ]}}).encode()
+        result = classify_drive_error("drive_upload_failed", error, candidate_scoped=False)
+        self.assertEqual(result.code, "drive_upload_failed")
+        self.assertFalse(result.permanent)
+        self.assertEqual(result.diagnostic, "drive_http=403 drive_reason=storagequotaexceeded")
+        error.resp.status = 987654321
+        error.content = b"not json secret-token"
+        self.assertEqual(
+            classify_drive_error("drive_upload_failed", error, candidate_scoped=False).diagnostic,
+            "drive_http=none drive_reason=unknown",
+        )
+
     def test_unseen_candidates_are_prioritized_without_dropping_verification_work(self):
         def candidate(product_key):
             return Candidate(
