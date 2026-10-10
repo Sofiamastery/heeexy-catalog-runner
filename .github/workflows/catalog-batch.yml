@@ -231,7 +231,6 @@ jobs:
       id-token: write
     outputs:
       selected: ${{ steps.process_batch.outputs.selected }}
-      batch_size: ${{ steps.process_batch.outputs.batch_size }}
       batch_full: ${{ steps.process_batch.outputs.batch_full }}
     env:
       CI: "true"
@@ -417,7 +416,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SAFE_BATCH_SIZE: ${{ needs.ingest.outputs.batch_size }}
+          # Read the validated manual input directly. Forwarding the same value
+          # through a job output is unsafe here: GitHub suppresses outputs whose
+          # value happens to equal a configured secret such as DEFAULT_BATCH_SIZE.
+          SAFE_BATCH_SIZE: ${{ inputs.batch_size }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" != "refs/heads/main" || -z "$GH_REPO" ]]; then
