@@ -2936,7 +2936,15 @@ def scan_png_only_root_and_discover_incremental_seeds(
     pinned_source_ids: frozenset[str],
     source_namespace: str,
 ) -> tuple[list[DriveAsset], list[ProductSeed], Counter[str]]:
-    """Inventory PNG Only once and read only exact product metadata sidecars."""
+    """Inventory PNG Only recursively, but discover products at one safe boundary.
+
+    The recursive walk is a coverage input only.  A folder may become an
+    authoritative incremental seed only when it is a direct child of the PNG
+    Only root and carries an explicit canonical sidecar.  Historical nested
+    layouts, folders without sidecars, and folders with ambiguous product
+    assets remain visible as diagnostics without entering the authoritative
+    seed set or its unresolved-hold gate.
+    """
 
     root = drive.get_metadata(root_id)
     if root.get("trashed") or root.get("mimeType") != FOLDER_MIME:
@@ -3014,6 +3022,55 @@ def scan_png_only_root_and_discover_incremental_seeds(
                         stats[f"{item.extension.lstrip('.')}_files"] += 1
                     else:
                         stats["ignored_non_product_files"] += 1
+
+                product_assets = tuple(
+                    asset
+                    for asset in direct_assets
+                    if asset.extension in {".png", ".svg"}
+                )
+                if depth != 1:
+                    if product_assets or sidecars:
+                        stats["coverage_non_direct_candidate_folders"] += 1
+                        stats["coverage_non_direct_product_assets"] += len(
+                            product_assets
+                        )
+                        stats["coverage_non_direct_sidecars"] += len(sidecars)
+                        if depth > 1:
+                            stats["coverage_nested_candidate_folders"] += 1
+                    continue
+
+                stats["direct_child_folders_scanned"] += 1
+                if not product_assets and not sidecars:
+                    continue
+                source_ids = {asset.file_id for asset in product_assets}
+                if source_ids and source_ids <= pinned_source_ids:
+                    stats["historical_pinned_folders_ignored"] += 1
+                    continue
+
+                pngs = tuple(
+                    asset for asset in product_assets if asset.extension == ".png"
+                )
+                svgs = tuple(
+                    asset for asset in product_assets if asset.extension == ".svg"
+                )
+                quarantine_reasons: list[str] = []
+                if not sidecars:
+                    quarantine_reasons.append("incremental_sidecar_missing")
+                if len(pngs) > 1:
+                    quarantine_reasons.append("incremental_png_identity_ambiguous")
+                if len(svgs) > 1:
+                    quarantine_reasons.append("incremental_svg_identity_ambiguous")
+                if (
+                    len(pngs) == 1
+                    and len(svgs) == 1
+                    and pngs[0].basename_normalized != svgs[0].basename_normalized
+                ):
+                    quarantine_reasons.append("incremental_svg_png_pair_mismatch")
+                if quarantine_reasons:
+                    stats["quarantined_direct_candidate_folders"] += 1
+                    for reason in sorted(set(quarantine_reasons)):
+                        stats[f"quarantine_{reason}"] += 1
+                    continue
 
                 seed, folder_stats, read_count = _incremental_seed_for_folder(
                     drive,

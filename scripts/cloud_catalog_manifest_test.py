@@ -1637,12 +1637,12 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
             return payload, dict(metadata)
 
     @classmethod
-    def folder(cls, folder_id, name):
+    def folder(cls, folder_id, name, parent_id=PNG_ROOT_ID):
         return {
             "id": folder_id,
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
-            "parents": [PNG_ROOT_ID],
+            "parents": [parent_id],
         }
 
     @classmethod
@@ -1717,14 +1717,35 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
         self.assertEqual(len(reconciled.records), 1)
         self.assertEqual(reconciled.holds, [])
 
-    def test_missing_duplicate_and_malformed_sidecars_are_held(self):
-        cases = []
-
+    def test_missing_sidecar_is_quarantined_outside_authoritative_gate(self):
         missing_children = {
             PNG_ROOT_ID: [self.folder(self.FOLDER_A, "Missing")],
             self.FOLDER_A: [self.png(self.PNG_A, "New Design.png", self.FOLDER_A)],
         }
-        cases.append(("missing", missing_children, {}, "incremental_sidecar_missing"))
+        drive, assets, seeds, stats = self.scan(missing_children, {})
+        self.assertEqual([asset.file_id for asset in assets], [self.PNG_A])
+        self.assertEqual(seeds, [])
+        self.assertEqual(drive.downloaded, [])
+        self.assertEqual(stats["quarantined_direct_candidate_folders"], 1)
+        self.assertEqual(stats["quarantine_incremental_sidecar_missing"], 1)
+        self.assertEqual(stats["incremental_seeds"], 0)
+        gate_inventory = Counter(authoritative_seeds=1, global_inventory_assets=1)
+        gate_inventory.update(stats)
+        report = build_inventory_report(
+            inventory_stats=gate_inventory,
+            metadata_stats=Counter(),
+            reconciliation=manifest.ReconciliationResult(records=[{}]),
+            manifest_payload=b"trusted-product\n",
+            expected_min_products=1,
+            expected_min_accepted=1,
+            generated_at="2026-10-10T00:00:00Z",
+        )
+        self.assertEqual(report["publication_gate"]["unresolved_holds"], 0)
+        self.assertEqual(report["publication_gate"]["blocking_issue_count"], 0)
+        self.assertTrue(report["publication_gate"]["eligible"])
+
+    def test_duplicate_and_malformed_canonical_sidecars_remain_blockers(self):
+        cases = []
 
         valid = incremental_sidecar_bytes()
         sidecar_a = self.sidecar(self.SIDECAR_A, self.FOLDER_A, valid)
@@ -1769,9 +1790,72 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
 
         for label, children, payloads, reason in cases:
             with self.subTest(label=label):
-                _, _, seeds, _ = self.scan(children, payloads)
+                _, assets, seeds, _ = self.scan(children, payloads)
                 self.assertEqual(len(seeds), 1)
                 self.assertIn(reason, seeds[0].hold_reasons)
+                reconciled, inventory_stats = reconcile_seed_catalog(
+                    seeds, assets, "heeexy-store"
+                )
+                report = build_inventory_report(
+                    inventory_stats=inventory_stats,
+                    metadata_stats=Counter(),
+                    reconciliation=reconciled,
+                    manifest_payload=b"",
+                    expected_min_products=1,
+                    expected_min_accepted=1,
+                    generated_at="2026-10-10T00:00:00Z",
+                )
+                self.assertEqual(report["publication_gate"]["unresolved_holds"], 1)
+                self.assertFalse(report["publication_gate"]["eligible"])
+
+    def test_nested_canonical_folder_remains_recursive_inventory_only(self):
+        payload = incremental_sidecar_bytes(
+            DriveProductFolderID=self.FOLDER_B,
+            DrivePNGFileID=self.PNG_B,
+        )
+        sidecar = self.sidecar(self.SIDECAR_B, self.FOLDER_B, payload)
+        children = {
+            PNG_ROOT_ID: [self.folder(self.FOLDER_A, "Legacy Container")],
+            self.FOLDER_A: [
+                self.folder(self.FOLDER_B, "Nested Product", self.FOLDER_A)
+            ],
+            self.FOLDER_B: [
+                self.png(self.PNG_B, "New Design.png", self.FOLDER_B),
+                sidecar,
+            ],
+        }
+        drive, assets, seeds, stats = self.scan(
+            children, {self.SIDECAR_B: (payload, sidecar)}
+        )
+        self.assertEqual([asset.file_id for asset in assets], [self.PNG_B])
+        self.assertEqual(seeds, [])
+        self.assertEqual(drive.downloaded, [])
+        self.assertEqual(stats["coverage_nested_candidate_folders"], 1)
+        self.assertEqual(stats["coverage_non_direct_sidecars"], 1)
+        self.assertEqual(stats["incremental_seeds"], 0)
+
+    def test_direct_multi_file_folder_is_quarantined_without_a_seed(self):
+        payload = incremental_sidecar_bytes()
+        sidecar = self.sidecar(self.SIDECAR_A, self.FOLDER_A, payload)
+        children = {
+            PNG_ROOT_ID: [self.folder(self.FOLDER_A, "Ambiguous")],
+            self.FOLDER_A: [
+                self.png(self.PNG_A, "New Design.png", self.FOLDER_A),
+                self.png(self.PNG_B, "Other Design.png", self.FOLDER_A),
+                sidecar,
+            ],
+        }
+        drive, assets, seeds, stats = self.scan(
+            children, {self.SIDECAR_A: (payload, sidecar)}
+        )
+        self.assertEqual(len(assets), 2)
+        self.assertEqual(seeds, [])
+        self.assertEqual(drive.downloaded, [])
+        self.assertEqual(stats["quarantined_direct_candidate_folders"], 1)
+        self.assertEqual(
+            stats["quarantine_incremental_png_identity_ambiguous"], 1
+        )
+        self.assertEqual(stats["incremental_seeds"], 0)
 
     def test_sidecar_never_matches_png_from_another_folder(self):
         payload = incremental_sidecar_bytes("Shared.png")
@@ -1787,14 +1871,14 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
                 sidecar,
             ],
         }
-        _, _, seeds, _ = self.scan(
+        _, _, seeds, stats = self.scan(
             children, {self.SIDECAR_B: (payload, sidecar)}
         )
-        self.assertEqual(len(seeds), 2)
+        self.assertEqual(len(seeds), 1)
         reasons = {reason for seed in seeds for reason in seed.hold_reasons}
-        self.assertIn("incremental_sidecar_missing", reasons)
         self.assertIn("incremental_sidecar_delivery_file_not_exact", reasons)
         self.assertFalse(any(not seed.hold_reasons for seed in seeds))
+        self.assertEqual(stats["quarantine_incremental_sidecar_missing"], 1)
 
     def test_description_sanitizer_preserves_core_and_removes_reviewed_suffixes(self):
         core = (
