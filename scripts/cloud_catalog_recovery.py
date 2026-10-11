@@ -361,6 +361,16 @@ def main():
                 role=m.MANIFEST_ROLE, payload=m.render_manifest_jsonl(union), expected_file_id=manifest_id)
             report["published"] = True
             save_report()
+        if args.publish:
+            available = bool(additions) or any(
+                (candidate.product_key not in state["completed"]
+                 and (candidate.product_key not in state["holds"]
+                      or p.hold_has_untried_repair(state["holds"][candidate.product_key])))
+                for candidate in (p.candidate_from_record(record) for record in previous))
+            output_path = env.get("GITHUB_OUTPUT")
+            if output_path:
+                with open(output_path, "a", encoding="utf-8") as output:
+                    output.write("work_available=" + str(available).lower() + "\n")
         print("catalog_recovery_status=ok", flush=True)
     except Exception as error:
         code = getattr(error, "code", "unexpected_failure")

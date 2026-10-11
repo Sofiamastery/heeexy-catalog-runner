@@ -18,6 +18,10 @@ on:
         required: true
         type: boolean
         default: false
+  schedule:
+    # Owner-approved automatic discovery. The old full-rebuild schedule stays
+    # disabled; this append-only path never replaces historical records.
+    - cron: "47 */6 * * *"
 
 permissions:
   contents: read
@@ -32,7 +36,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     environment: production-catalog
+    outputs:
+      work_available: ${{ steps.reconcile.outputs.work_available }}
     env:
+      CI: "true"
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
       PIP_NO_CACHE_DIR: "1"
@@ -56,6 +63,7 @@ jobs:
       - name: Validate append-only recovery
         run: python -B -m unittest scripts/cloud_catalog_recovery_test.py scripts/repository_safety_test.py
       - name: Reconcile private Drive catalog
+        id: reconcile
         env:
           RUNNER_ENVIRONMENT: github-hosted
           HEEEXY_PNG_ONLY_ROOT_FOLDER_ID: ${{ secrets.PNG_ONLY_ROOT_FOLDER_ID }}
@@ -66,7 +74,7 @@ jobs:
           GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
           GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
           GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
-          PUBLISH_APPROVED: ${{ inputs.publish }}
+          PUBLISH_APPROVED: ${{ github.event_name == 'schedule' || inputs.publish }}
           DIAGNOSE_HOLDS: ${{ inputs.diagnose_holds }}
         run: |
           set -euo pipefail
@@ -76,7 +84,9 @@ jobs:
           python -B scripts/cloud_catalog_recovery.py "${args[@]}"
   continue:
     needs: recover
-    if: ${{ inputs.publish == true && inputs.start_drain == true && needs.recover.result == 'success' }}
+    if: >-
+      ${{ (github.event_name == 'schedule' || (inputs.publish == true && inputs.start_drain == true)) &&
+          needs.recover.result == 'success' && needs.recover.outputs.work_available == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

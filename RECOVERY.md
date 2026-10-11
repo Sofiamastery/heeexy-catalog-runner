@@ -1,6 +1,7 @@
 # Append-only catalog recovery
 
-`catalog-recovery.yml` is a separate, manually dispatched recovery workflow.
+`catalog-recovery.yml` is a separate recovery workflow, manually dispatchable
+and scheduled every six hours after owner-approved automatic discovery.
 It uses the same repository authorization, protected production environment,
 one-day retention and concurrency group as the batch importer. No assets,
 private metadata or credentials belong in this repository.
@@ -30,6 +31,19 @@ are disabled. Product files are never downloaded to an owner's workstation.
 With `publish=true` and `start_drain=true`, a successful recovery starts the
 existing batch workflow with size 250, no full manifest rebuild, and no blind
 retry of held records. It safely resumes existing completed checkpoints.
+Scheduled runs use the same append-only publication path and trigger a drain
+only when verified additions or unprocessed/repaired candidates remain. The
+schedule is not an exact-time service-level guarantee; GitHub may delay it.
+Disable this workflow in Actions to pause automatic discovery. Do not enable
+the old `SCHEDULE_ENABLED` full-builder gate as a substitute.
+
+Diagnosed held SVGs permit C2PA provenance only inside inert SVG metadata;
+external references, scripts and foreign render-tree nodes remain forbidden.
+Very large originals with a validated SVG twin may be delivered up to 400 MP
+and 20,000 pixels/side, unchanged. Their public previews use a bounded SVG
+render, never a full decoded original canvas. CRC/header verification remains
+enabled, and PNG-only raster inputs retain the tighter 100 MP limit. The site
+must have the matching ingest contract deployed before enabling this producer.
 
 Do not enable an older full-rebuild schedule without reconciling the added
 identities into its input ledgers: its no-loss check must reject any proposal
