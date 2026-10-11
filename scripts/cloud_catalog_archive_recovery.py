@@ -138,6 +138,11 @@ def cloud_reader(drive, metadata, budget=MAX_INDEX_BYTES):
             with session.get(f"https://www.googleapis.com/drive/v3/files/{metadata['id']}",
                     params={"alt": "media", "supportsAllDrives": "true"},
                     headers={"Range": f"bytes={start}-{end}"}, timeout=90, stream=True) as response:
+                if response.status_code >= 400:
+                    # Service/auth failures stop the run, never quarantine every
+                    # product as though the artwork itself were invalid.
+                    raise p.PipelineError("drive_download_failed", permanent=response.status_code in {404, 410},
+                        diagnostic=f"drive_http={response.status_code} drive_reason=unknown")
                 if response.status_code != 206:
                     # Do not accept a silently ignored Range/full-archive body.
                     raise m.ManifestBuilderError("archive_range_response_invalid")

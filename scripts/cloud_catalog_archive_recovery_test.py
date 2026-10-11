@@ -144,6 +144,19 @@ class ArchiveRecoveryTests(unittest.TestCase):
         self.assertEqual(result, (False, True))
         self.assertEqual(sink.getvalue(), b"fixture-text-only")
 
+    def test_http_auth_and_transient_errors_are_not_artwork_holds(self):
+        for status in (401, 403, 429, 503):
+            response = Mock(status_code=status)
+            session = Mock()
+            session.get.return_value.__enter__ = Mock(return_value=response)
+            session.get.return_value.__exit__ = Mock(return_value=False)
+            with patch.object(a.p, "enforce_cloud_runtime"), patch("google.auth.transport.requests.AuthorizedSession") as factory:
+                factory.return_value.__enter__.return_value = session
+                with self.assertRaises(a.p.PipelineError) as caught:
+                    with a.cloud_reader(self.drive, self.meta) as reader:
+                        reader.read(3)
+                self.assertFalse(caught.exception.permanent)
+
 
 if __name__ == "__main__":
     unittest.main()
