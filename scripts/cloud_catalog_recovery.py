@@ -7,10 +7,12 @@ inside RUNNER_TEMP. Private reports retain unresolved identities explicitly.
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -119,6 +121,54 @@ def json_product_record(payload, sidecar, children, root_id, namespace):
     return record
 
 
+def compatible_csv_payload(payload, png_asset):
+    """Adapt two observed historical metadata schemas, not arbitrary drafts.
+
+    Original files stay unchanged. Title/description/tags are not rewritten.
+    Owner approval dates and completed visual-QA evidence are preserved in the
+    original private sidecar; this adapter only normalizes contract fields.
+    """
+    reader = csv.DictReader(io.StringIO(payload.decode("utf-8-sig")), strict=True)
+    headers = reader.fieldnames or []
+    if len({name.casefold() for name in headers}) != len(headers):
+        raise m.ManifestBuilderError("csv_duplicate_headers")
+    rows = [row for row in reader if any(row.values())]
+    if len(rows) != 1 or None in rows[0]:
+        raise m.ManifestBuilderError("csv_single_row_required")
+    row = rows[0]
+    approval = row.get("OwnerApproval", "")
+    if re.fullmatch(r"explicit_(?:upload_instruction_)?\d{4}-\d{2}-\d{2}", approval):
+        try:
+            datetime.strptime(approval[-10:], "%Y-%m-%d")
+        except ValueError as error:
+            raise m.ManifestBuilderError("csv_approval_date_invalid") from error
+        row["OwnerApproval"] = "owner_approved"
+    if "DeliveryKind" not in row and {"FinalPNG_SHA256", "FinalPNGBytes", "VisualQA", "GlobalMarketplaceStatus"} <= row.keys():
+        if (row["VisualQA"] != "PASS" or row["GlobalMarketplaceStatus"] != "READY_AFTER_FINAL_VISUAL_QA"
+                or row.get("Mode") != "RGBA" or row.get("Background") != "Genuine transparency"):
+            raise m.ManifestBuilderError("legacy_csv_visual_qa_not_passed")
+        if not png_asset.sha256_checksum or row["FinalPNG_SHA256"].lower() != png_asset.sha256_checksum.lower():
+            raise m.ManifestBuilderError("legacy_csv_png_hash_mismatch")
+        link = row.get("DigitalFileLink", "")
+        link_match = re.fullmatch(r"https://drive\.google\.com/uc\?export=download&id=([A-Za-z0-9_-]{20,200})", link)
+        if not link_match or link_match.group(1) != png_asset.file_id:
+            raise m.ManifestBuilderError("legacy_csv_drive_identity_mismatch")
+        if row.get("DeliveryFile") != png_asset.name or int(row["FinalPNGBytes"]) != png_asset.size_bytes:
+            raise m.ManifestBuilderError("legacy_csv_file_metadata_mismatch")
+        # This owner-approved website import does not imply an active Etsy
+        # listing. Preserve the actual marketplace state; invent no stage.
+        return m.MetadataEvidence(source_label=p.METADATA_FILENAME, section="legacy-final-visual-qa", row_number=2,
+            title=m.normalize_text(row.get("EtsyTitle")),
+            description=m.sanitize_incremental_etsy_description(row.get("EtsyDescription", "")),
+            tags=m.split_terms(row.get("EtsyTags", "")), drive_ids=(png_asset.file_id,),
+            source_names=(png_asset.name,))
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(row))
+    writer.writeheader()
+    writer.writerow(row)
+    return output.getvalue().encode("utf-8")
+
+
 def scan_tree(client_for_thread, root_id):
     """Bounded parallel metadata list calls; separate Drive client per thread."""
     folders = {root_id: {"id": root_id, "name": "root", "depth": 0}}
@@ -189,8 +239,11 @@ def discover(drive, root_id, namespace, children_by_parent, previous):
                         raise m.ManifestBuilderError("csv_product_assets_ambiguous")
                     if svgs and pngs[0].basename_normalized != svgs[0].basename_normalized:
                         raise m.ManifestBuilderError("csv_svg_pair_mismatch")
-                    evidence = m.parse_incremental_product_sidecar(
-                        payload, folder_id=parent, sidecar_metadata=sidecar,
+                    if sidecar.get("mimeType") not in m.INCREMENTAL_SIDECAR_MIMES or sidecar.get("parents") != [parent]:
+                        raise m.ManifestBuilderError("csv_sidecar_parent_or_mime_invalid")
+                    compatible = compatible_csv_payload(payload, pngs[0])
+                    evidence = compatible if isinstance(compatible, m.MetadataEvidence) else m.parse_incremental_product_sidecar(
+                        compatible, folder_id=parent, sidecar_metadata=sidecar,
                         png_asset=pngs[0], svg_asset=svgs[0] if svgs else None)
                     seed = m.ProductSeed(identity=m._seed_identity(namespace, "drive:" + pngs[0].file_id),
                         seed_key="drive:" + pngs[0].file_id,
@@ -200,6 +253,7 @@ def discover(drive, root_id, namespace, children_by_parent, previous):
                     if len(result.records) != 1 or result.holds:
                         raise m.ManifestBuilderError("csv_reconciliation_held")
                     record = result.records[0]
+                    record["metadata_provenance"]["raw_sidecar_sha256"] = hashlib.sha256(payload).hexdigest()
                 ids = source_ids(record)
                 if ids <= known:
                     continue

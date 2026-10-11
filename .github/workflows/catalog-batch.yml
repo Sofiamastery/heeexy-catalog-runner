@@ -44,6 +44,11 @@ concurrency:
 jobs:
   manifest:
     name: Refresh private metadata-only manifest
+    # Serialize manifest writers, while append-only discovery can overlap a
+    # batch that is consuming an already validated immutable snapshot.
+    concurrency:
+      group: private-catalog-${{ (github.event_name == 'schedule' || inputs.rebuild_manifest == true) && 'metadata' || format('snapshot-{0}', github.run_id) }}-${{ github.repository_id }}
+      cancel-in-progress: false
     if: >-
       ${{ github.ref == 'refs/heads/main' &&
           (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}

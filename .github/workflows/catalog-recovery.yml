@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: private-catalog-${{ github.repository_id }}
+  group: private-catalog-metadata-${{ github.repository_id }}
   cancel-in-progress: false
 
 jobs:

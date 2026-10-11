@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import unittest
+from types import SimpleNamespace
 from scripts import cloud_catalog_recovery as r
 
 
@@ -32,6 +33,39 @@ def record():
 
 
 class RecoveryTests(unittest.TestCase):
+    def csv_payload(self, row):
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+        return output.getvalue().encode()
+
+    def test_existing_explicit_approval_date_formats(self):
+        for approval in ("explicit_2026-10-02", "explicit_upload_instruction_2026-10-05"):
+            adapted = r.compatible_csv_payload(self.csv_payload({"OwnerApproval": approval}), None)
+            self.assertIn(b"owner_approved", adapted)
+        with self.assertRaisesRegex(r.m.ManifestBuilderError, "csv_approval_date_invalid"):
+            r.compatible_csv_payload(self.csv_payload({"OwnerApproval": "explicit_2026-99-02"}), None)
+        adapted = r.compatible_csv_payload(self.csv_payload({"OwnerApproval": "pending"}), None)
+        self.assertIn(b"pending", adapted)
+
+    def test_legacy_final_qa_csv_uses_exact_hash_id_and_existing_copy(self):
+        png = SimpleNamespace(file_id=PNG_ID, name="sample.png", size_bytes=123, sha256_checksum=DIGEST)
+        row = {"FinalPNG_SHA256": DIGEST, "FinalPNGBytes": "123", "VisualQA": "PASS",
+            "GlobalMarketplaceStatus": "READY_AFTER_FINAL_VISUAL_QA", "Mode": "RGBA",
+            "Background": "Genuine transparency", "DigitalFileLink": "https://drive.google.com/uc?export=download&id=" + PNG_ID,
+            "DeliveryFile": "sample.png", "EtsyTitle": "Original illustration",
+            "EtsyDescription": "An original design for digital crafting projects.", "EtsyTags": "original, illustration"}
+        evidence = r.compatible_csv_payload(self.csv_payload(row), png)
+        self.assertEqual(evidence.title, row["EtsyTitle"])
+        self.assertEqual(evidence.description, row["EtsyDescription"])
+        self.assertEqual(evidence.drive_ids, (PNG_ID,))
+        for field, value in (("VisualQA", "PENDING"), ("FinalPNG_SHA256", "0" * 64),
+                             ("FinalPNGBytes", "124"), ("DeliveryFile", "other.png"),
+                             ("DigitalFileLink", "https://example.invalid/file")):
+            with self.assertRaises(r.m.ManifestBuilderError):
+                r.compatible_csv_payload(self.csv_payload({**row, field: value}), png)
+
     def test_preserves_original_title_description_and_tags(self):
         data, _, _ = fixture()
         result = record()

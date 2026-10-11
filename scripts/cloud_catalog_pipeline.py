@@ -2090,7 +2090,16 @@ def read_manifest_from_drive(
 ) -> tuple[list[Candidate], Counter[str]]:
     with tempfile.TemporaryDirectory(prefix="manifest-", dir=runner_temp) as temp_name:
         manifest_path = Path(temp_name) / "catalog.jsonl"
-        drive.download_to(file_id, manifest_path, MAX_MANIFEST_BYTES)
+        # Recovery may append while a batch loads its private snapshot. Retry
+        # only revision/size races, always fetching fresh source metadata.
+        for attempt in range(3):
+            try:
+                drive.download_to(file_id, manifest_path, MAX_MANIFEST_BYTES)
+                break
+            except PipelineError as error:
+                if error.code not in {"drive_source_changed_during_download", "drive_download_size_mismatch"} or attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
         try:
             with manifest_path.open("r", encoding="utf-8-sig", newline="") as stream:
                 return parse_manifest_jsonl(stream)

@@ -42,6 +42,7 @@ from cloud_catalog_pipeline import (  # noqa: E402
     ingest_auth_headers,
     merge_candidates,
     parse_manifest_jsonl,
+    read_manifest_from_drive,
     preview_padding,
     prioritize_unseen_candidates,
     hold_has_untried_repair,
@@ -87,6 +88,35 @@ def whitelist_record(**overrides):
 
 
 class CloudCatalogPipelineTests(unittest.TestCase):
+    def test_manifest_snapshot_retries_only_bounded_revision_races(self):
+        drive = mock.Mock()
+        def write_snapshot(file_id, path, maximum_bytes):
+            path.write_text(json.dumps(whitelist_record()) + "\n", encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory, mock.patch("cloud_catalog_pipeline.time.sleep"):
+            drive.download_to.side_effect = [PipelineError("drive_source_changed_during_download"), None]
+            # The second successful call must write the synthetic snapshot.
+            calls = 0
+            def race_then_snapshot(*args):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PipelineError("drive_source_changed_during_download")
+                write_snapshot(*args)
+            drive.download_to.side_effect = race_then_snapshot
+            candidates, _ = read_manifest_from_drive(drive, ROOT_ID, Path(directory))
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(calls, 2)
+            drive.reset_mock()
+            drive.download_to.side_effect = PipelineError("drive_download_size_mismatch")
+            with self.assertRaisesRegex(PipelineError, "drive_download_size_mismatch"):
+                read_manifest_from_drive(drive, ROOT_ID, Path(directory))
+            self.assertEqual(drive.download_to.call_count, 3)
+            drive.reset_mock()
+            drive.download_to.side_effect = PipelineError("drive_permission_check_failed")
+            with self.assertRaisesRegex(PipelineError, "drive_permission_check_failed"):
+                read_manifest_from_drive(drive, ROOT_ID, Path(directory))
+            self.assertEqual(drive.download_to.call_count, 1)
+
     def test_drive_diagnostics_expose_only_allowlisted_status_and_reasons(self):
         error = RuntimeError("secret-token and private-file-url must never appear")
         error.resp = type("Response", (), {"status": 403})()

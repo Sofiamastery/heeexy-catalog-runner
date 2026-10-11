@@ -3,7 +3,11 @@
 `catalog-recovery.yml` is a separate recovery workflow, manually dispatchable
 and scheduled every six hours after owner-approved automatic discovery.
 It uses the same repository authorization, protected production environment,
-one-day retention and concurrency group as the batch importer. No assets,
+one-day retention as the batch importer. Metadata writers share a separate
+concurrency lock, allowing discovery to overlap the current upload batch.
+Ingest checkpoints still have a single serialized writer. A batch consumes a
+validated snapshot and retries a manifest revision race at most three times.
+No assets,
 private metadata or credentials belong in this repository.
 
 Run an audit with `publish=false` before reviewing unfamiliar metadata formats.
@@ -17,6 +21,11 @@ contract and a JSON sidecar with an explicit Etsy filename and original
 metadata. JSON matching requires an exact same-parent PNG filename and a
 matching canonical SHA-256 from Drive. A bare folder title is never metadata.
 Explicit rights blocks, ambiguous identities and missing metadata stay held.
+
+Historical CSV adapters recognize dated explicit owner approvals and a
+completed final-visual-QA schema, with exact filename, Drive ID, byte size and
+SHA-256 matching. They preserve original copy and do not fabricate marketplace
+publication status. Unknown or unfinished variants remain held.
 
 The private report records the previous manifest's modification timestamp,
 files created after that baseline, new valid candidates, unresolved PNG file
