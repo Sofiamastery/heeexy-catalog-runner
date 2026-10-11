@@ -215,6 +215,29 @@ def discover(drive, root_id, namespace, children_by_parent, previous):
     return additions, holds
 
 
+def discover_parallel(client_for_thread, root_id, namespace, children_by_parent, previous):
+    """Fetch independent sidecars concurrently, then reconcile claims serially."""
+    work = [(parent, items) for parent, items in sorted(children_by_parent.items())
+            if any(item.get("name") == p.METADATA_FILENAME
+                   or str(item.get("name", "")).endswith("_metadata.json") for item in items)]
+    declared_total = sum(int(item.get("size") or 0) for _, items in work for item in items
+                         if item.get("name") == p.METADATA_FILENAME
+                         or str(item.get("name", "")).endswith("_metadata.json"))
+    if declared_total > m.MAX_INCREMENTAL_SIDECAR_TOTAL_BYTES:
+        raise m.ManifestBuilderError("sidecar_total_limit")
+    def inspect(entry):
+        parent, items = entry
+        return discover(client_for_thread(), root_id, namespace, {parent: items}, previous)
+    additions, holds = [], []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for proposed, rejected in executor.map(inspect, work):
+            additions.extend(proposed)
+            holds.extend(rejected)
+    # Cross-folder conflicts are never resolved by which thread finishes first.
+    append_only_union(previous, additions)
+    return additions, holds
+
+
 def diagnose_held(drive, previous, state, runner_temp):
     """Inspect at most three files per held reason; no validation is weakened."""
     diagnostics = []
@@ -287,7 +310,7 @@ def main():
         baseline = drive.get_metadata(manifest_id).get("modifiedTime", "")
         state, _ = drive.load_state(reports_id)
         folders, children, stats = scan_tree(client, root_id)
-        additions, holds = discover(drive, root_id, namespace, children, previous)
+        additions, holds = discover_parallel(client, root_id, namespace, children, previous)
         union = append_only_union(previous, additions)
         png_inventory = {item["id"] for items in children.values() for item in items if item.get("mimeType") == p.PNG_MIME}
         known_png = set()
