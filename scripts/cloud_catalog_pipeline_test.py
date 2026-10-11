@@ -44,6 +44,7 @@ from cloud_catalog_pipeline import (  # noqa: E402
     parse_manifest_jsonl,
     preview_padding,
     prioritize_unseen_candidates,
+    hold_has_untried_repair,
     public_site_metadata,
     safe_summary,
     source_revision_descriptor,
@@ -550,6 +551,21 @@ class CloudCatalogPipelineTests(unittest.TestCase):
                 b'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
                 b'<rdf:RDF/></svg>'
             )
+
+    def test_c2pa_is_allowed_only_as_inert_metadata(self):
+        prefix = b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:c2pa="http://c2pa.org/manifest">'
+        validate_svg_bytes(prefix + b'<metadata><c2pa:manifest>provenance</c2pa:manifest></metadata></svg>')
+        with self.assertRaisesRegex(PipelineError, "svg_namespace_not_allowed"):
+            validate_svg_bytes(prefix + b'<c2pa:manifest/></svg>')
+        with self.assertRaisesRegex(PipelineError, "svg_active_or_external_content"):
+            validate_svg_bytes(prefix + b'<metadata><c2pa:manifest onload="bad()"/></metadata></svg>')
+        with self.assertRaisesRegex(PipelineError, "svg_active_or_external_content"):
+            validate_svg_bytes(prefix + b'<metadata><c2pa:manifest href="https://example.invalid/data"/></metadata></svg>')
+
+    def test_diagnosed_hold_repair_retries_once_only(self):
+        self.assertTrue(hold_has_untried_repair({"reason": "svg_namespace_not_allowed"}))
+        self.assertFalse(hold_has_untried_repair({"reason": "svg_namespace_not_allowed", "repair_version": "c2pa-inert-metadata-v1"}))
+        self.assertFalse(hold_has_untried_repair({"reason": "png_decode_failed"}))
 
     def test_drive_http_errors_separate_file_holds_from_service_stops(self):
         class FakeResponse:

@@ -59,6 +59,9 @@ MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_METADATA_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_PIXELS = 100_000_000
+# Only these diagnosed failures get one automatic retry after a code fix.
+# A failed retry records this version and is not retried on every drain.
+HOLD_REPAIR_VERSIONS = {"svg_namespace_not_allowed": "c2pa-inert-metadata-v1"}
 MAX_ARCHIVE_ENTRIES = 50_000
 MAX_SVG_ELEMENTS = 250_000
 MAX_TITLE_CHARS = 256
@@ -836,6 +839,7 @@ def validate_svg_bytes(payload: bytes) -> None:
         raise PipelineError("svg_xml_invalid", permanent=True) from error
     svg_namespace = "http://www.w3.org/2000/svg"
     inert_namespaces = {
+        "http://c2pa.org/manifest",
         "http://creativecommons.org/ns#",
         "http://purl.org/dc/elements/1.1/",
         "http://www.inkscape.org/namespaces/inkscape",
@@ -1429,6 +1433,11 @@ def prioritize_unseen_candidates(
         return 0
 
     return sorted(candidates, key=priority)
+
+
+def hold_has_untried_repair(hold: Mapping[str, Any]) -> bool:
+    version = HOLD_REPAIR_VERSIONS.get(str(hold.get("reason") or ""))
+    return bool(version and hold.get("repair_version") != version)
 
 
 def is_descendant_folder(
@@ -2213,7 +2222,7 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
     candidates = prioritize_unseen_candidates(
         candidates,
         completed,
-        holds,
+        {key: value for key, value in holds.items() if not hold_has_untried_repair(value)},
         retry_holds=config.retry_holds,
     )
     pending: list[tuple[Candidate, str, dict[str, dict[str, Any]]]] = []
@@ -2231,6 +2240,7 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
                     "fingerprint": candidate.fingerprint,
                     "artifact_recipe_version": ARTIFACT_RECIPE_VERSION,
                     "reason": error.code,
+                    "repair_version": HOLD_REPAIR_VERSIONS.get(error.code),
                     "held_at_epoch": int(time.time()),
                 }
                 completed.pop(candidate.product_key, None)
@@ -2244,6 +2254,7 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
         if (
             not config.retry_holds
             and holds.get(candidate.product_key, {}).get("fingerprint") == fingerprint
+            and not hold_has_untried_repair(holds.get(candidate.product_key, {}))
         ):
             stats["unchanged_hold"] += 1
             continue
@@ -2277,6 +2288,7 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
                         "fingerprint": fingerprint,
                         "artifact_recipe_version": ARTIFACT_RECIPE_VERSION,
                         "reason": error.code,
+                        "repair_version": HOLD_REPAIR_VERSIONS.get(error.code),
                         "held_at_epoch": int(time.time()),
                     }
                     stats["held"] += 1
