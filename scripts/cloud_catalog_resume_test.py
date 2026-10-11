@@ -13,7 +13,7 @@ class ResumeTests(unittest.TestCase):
         candidates = [SimpleNamespace(product_key="old", fingerprint="seed-old"),
                       SimpleNamespace(product_key="new", fingerprint="seed-new")]
         state = {"completed": {"old": {"fingerprint": "artifact-old"}}, "holds": {}}
-        drive = Mock()
+        drive = Mock(spec=p.DriveClient)
         drive.load_state.return_value = (state, "checkpoint")
         drive.save_state.return_value = "checkpoint"
         config = SimpleNamespace(product_zips_folder_id="zips", reports_folder_id="reports",
