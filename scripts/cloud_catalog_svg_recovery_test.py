@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import unittest
 from unittest.mock import Mock
@@ -55,6 +56,30 @@ class SvgRecoveryTests(unittest.TestCase):
         client.assert_not_called()
         with self.assertRaisesRegex(s.m.ManifestBuilderError, "configuration_invalid"):
             s.discover(client, {"HEEEXY_SVG_RECOVERY_LEDGER_ID": "s" * 32}, [], lambda record: set())
+
+    def test_metadata_only_discovery_emits_valid_renderable_record(self):
+        payload = json.dumps(row()).encode()
+        class Drive:
+            def download_bytes(self, file_id, limit):
+                # Only the pinned metadata ledger may be fetched by discovery.
+                self_id = "m" * 32
+                if file_id != self_id:
+                    raise AssertionError("artwork_download_forbidden")
+                return payload, {}
+            def get_metadata(self, file_id, **kwargs):
+                return {"id": file_id, "name": "original.svg", "mimeType": "image/svg+xml", "size": "100",
+                        "parents": ["f" * 32], "md5Checksum": "a" * 32, "sha256Checksum": "a" * 64}
+        env = {"HEEEXY_SVG_RECOVERY_LEDGER_ID": "m" * 32,
+               "HEEEXY_SVG_RECOVERY_LEDGER_SHA256": hashlib.sha256(payload).hexdigest(),
+               "HEEEXY_CATALOG_SOURCE_NAMESPACE": "example-store"}
+        records, report = s.discover(Drive, env, [], lambda record: set())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(report["holds"], [])
+        self.assertTrue(records[0]["assets"]["render_needed"])
+        self.assertEqual(records[0]["metadata"]["title"], row()["title"])
+        self.assertIsNotNone(s.p.candidate_from_record(records[0]))
+        with self.assertRaisesRegex(s.m.ManifestBuilderError, "hash_mismatch"):
+            s.discover(Drive, {**env, "HEEEXY_SVG_RECOVERY_LEDGER_SHA256": "b" * 64}, [], lambda record: set())
 
 
 if __name__ == "__main__":

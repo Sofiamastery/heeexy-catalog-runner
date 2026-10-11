@@ -30,12 +30,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
@@ -2314,6 +2315,29 @@ def publish_outcomes(config, oauth, pending, run_root, drive):
             yield from outcomes
 
 
+def warm_candidate_metadata(client_factory, candidates, metadata_cache) -> None:
+    """Bounded metadata-only lookahead; isolated HTTP clients, no artwork I/O.
+
+    Failed prefetches deliberately remain uncached. The authoritative serial
+    selector retries and classifies that candidate using its existing guards.
+    """
+    source_ids = sorted({source_id for candidate in candidates
+                         for _, source_id in candidate_source_references(candidate)
+                         if source_id not in metadata_cache})
+    local = threading.local()
+    def fetch(source_id):
+        try:
+            if not hasattr(local, "drive"):
+                local.drive = client_factory()
+            return source_id, local.drive.get_metadata(source_id, candidate_scoped=True)
+        except PipelineError:
+            return source_id, None
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for source_id, metadata in executor.map(fetch, source_ids):
+            if metadata is not None:
+                metadata_cache[source_id] = metadata
+
+
 def checkpoint_coverage(candidates: Sequence[Candidate], state: Mapping[str, Any]) -> dict[str, Any]:
     """Account for this manifest only, never claim all of Drive is published."""
     keys = {candidate.product_key for candidate in candidates}
@@ -2402,6 +2426,9 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
     transient_error: PipelineError | None = None
     safe_progress("select", 0, len(candidates))
     for candidate_index, candidate in enumerate(candidates):
+        if candidate_index % 128 == 0:
+            warm_candidate_metadata(lambda: DriveClient(*oauth),
+                                    candidates[candidate_index:candidate_index + 128], source_metadata_cache)
         if candidate_index and candidate_index % 250 == 0:
             safe_progress("select", candidate_index, len(candidates))
         try:

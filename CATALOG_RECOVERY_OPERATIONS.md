@@ -8,6 +8,7 @@
 - The manifest update is append-only and rechecks the original manifest bytes before publication. Existing product identities and metadata stay intact. The incomplete full-rebuild SVG workbook changes are a separate, unpublished workstream.
 - The private recovery report includes SVG row dispositions and hold reasons. It explicitly keeps `full_library_complete=false`: completing an input ledger is not proof that all source folders or unresolved archive identities are covered.
 - The pipeline emits counts-only selection progress every 250 candidates and publication progress every 10 completed outcomes on stderr. The strict stdout batch summary remains unchanged.
+- Selection prefetches metadata for at most 128 candidates at a time with four isolated HTTP clients. It does not download artwork or bypass source fingerprint validation. Failed lookups remain uncached for the original per-candidate failure handling; repeated source IDs are fetched once per cache.
 - Private checkpoint coverage distinguishes `more_work`, `manifest_has_holds`, and `manifest_snapshot_settled`, with counts for this manifest snapshot only. It is not a live revision audit or a whole-Drive completion claim.
 - A batch resumes once from its checkpoint after a verified transient Drive status (408/425/429/5xx or known transient reason) or an ingest network failure. It waits 30 seconds. Permission/authentication, validation and unknown failures are not blindly retried. Provider-level retries remain bounded. No paid runners or local asset processing are introduced.
 

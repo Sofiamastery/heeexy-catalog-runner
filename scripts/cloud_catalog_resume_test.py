@@ -8,6 +8,23 @@ from scripts import cloud_catalog_pipeline as p
 
 
 class ResumeTests(unittest.TestCase):
+    def test_metadata_lookahead_preserves_cache_and_does_not_hide_failed_lookup(self):
+        candidates = [SimpleNamespace(source_id=key) for key in ("cached", "new", "new", "failed")]
+        calls = []
+        class Drive:
+            def get_metadata(self, key, **kwargs):
+                calls.append(key)
+                if key == "failed":
+                    raise p.PipelineError("drive_metadata_failed", permanent=True)
+                return {"id": key, "version": "new-version"}
+        cache = {"cached": {"id": "cached", "version": "original-version"}}
+        with patch.object(p, "candidate_source_references", side_effect=lambda c: [("svg", c.source_id)]):
+            p.warm_candidate_metadata(Drive, candidates, cache)
+        self.assertCountEqual(calls, ["new", "failed"])
+        self.assertNotIn("failed", cache)  # Serial selector must still handle it.
+        self.assertEqual(cache["cached"]["version"], "original-version")
+        self.assertEqual(cache["new"]["version"], "new-version")
+
     def test_one_retry_then_stop_no_infinite_loop(self):
         error = p.PipelineError("drive_download_failed", diagnostic="drive_http=503 drive_reason=unknown")
         with patch.object(p, "run_pipeline", side_effect=[error, Counter(published=2)]) as run, patch.object(p.time, "sleep"):
