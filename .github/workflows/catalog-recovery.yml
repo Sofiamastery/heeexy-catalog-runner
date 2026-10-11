@@ -1,0 +1,93 @@
+name: Private catalog discovery and recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Append exact verified new PNG metadata, preserving every prior record
+        required: true
+        type: boolean
+        default: false
+      diagnose_holds:
+        description: Inspect a bounded held-asset sample on the cloud runner only
+        required: true
+        type: boolean
+        default: false
+      start_drain:
+        description: Continue processing the refreshed catalog in cloud batches
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-catalog-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: production-catalog
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PIP_NO_CACHE_DIR: "1"
+    steps:
+      - name: Authorize private recovery
+        env:
+          EXPECTED_REPOSITORY: ${{ secrets.EXPECTED_REPOSITORY }}
+          ACTIONS_RETENTION_DAYS: ${{ secrets.ACTIONS_RETENTION_DAYS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$EXPECTED_REPOSITORY" && "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$ACTIONS_RETENTION_DAYS" == "1" ]]
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ephemeral runtime
+        run: python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+      - name: Validate append-only recovery
+        run: python -B -m unittest scripts/cloud_catalog_recovery_test.py scripts/repository_safety_test.py
+      - name: Reconcile private Drive catalog
+        env:
+          RUNNER_ENVIRONMENT: github-hosted
+          HEEEXY_PNG_ONLY_ROOT_FOLDER_ID: ${{ secrets.PNG_ONLY_ROOT_FOLDER_ID }}
+          HEEEXY_CATALOG_MANIFEST_DRIVE_FILE_ID: ${{ secrets.CATALOG_MANIFEST_DRIVE_FILE_ID }}
+          HEEEXY_REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
+          HEEEXY_CATALOG_METADATA_FOLDER_ID: ${{ secrets.CATALOG_METADATA_FOLDER_ID }}
+          HEEEXY_CATALOG_SOURCE_NAMESPACE: ${{ secrets.CATALOG_SOURCE_NAMESPACE }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+          PUBLISH_APPROVED: ${{ inputs.publish }}
+          DIAGNOSE_HOLDS: ${{ inputs.diagnose_holds }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$PUBLISH_APPROVED" == "true" ]]; then args+=(--publish); fi
+          if [[ "$DIAGNOSE_HOLDS" == "true" ]]; then args+=(--diagnose-holds); fi
+          python -B scripts/cloud_catalog_recovery.py "${args[@]}"
+  continue:
+    needs: recover
+    if: ${{ inputs.publish == true && inputs.start_drain == true && needs.recover.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the refreshed cloud drain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api --method POST "repos/${GH_REPO}/actions/workflows/catalog-batch.yml/dispatches" \
+            --input - <<'JSON'
+          {"ref":"main","inputs":{"batch_size":"100","retry_holds":"false","rebuild_manifest":"false","drain_catalog":"true"}}
+          JSON
