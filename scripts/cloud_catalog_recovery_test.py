@@ -1,5 +1,7 @@
 import copy
+import csv
 import hashlib
+import io
 import json
 import unittest
 from scripts import cloud_catalog_recovery as r
@@ -104,6 +106,29 @@ class RecoveryTests(unittest.TestCase):
     def test_no_local_runtime_entry(self):
         with self.assertRaisesRegex(r.p.PipelineError, "cloud_runtime_required"):
             r.p.enforce_cloud_runtime({})
+
+    def test_canonical_csv_discovery_and_repeat_skip(self):
+        _, png, _ = fixture()
+        values = {"DeliveryFile": png["name"], "DeliveryKind": "transparent_png",
+            "OwnerApproval": "approved", "EtsyStage": "active_verified",
+            "EtsyTitle": "Example Bow Charm", "EtsyDescription": "An original illustration for digital craft projects.",
+            "EtsyTags": "example, illustration", "PNG_Bytes": "100", "PNG_SHA256": DIGEST}
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=list(values))
+        writer.writeheader()
+        writer.writerow(values)
+        payload = output.getvalue().encode()
+        sidecar = {"id": SIDECAR_ID, "name": r.p.METADATA_FILENAME, "mimeType": "text/csv",
+                   "parents": [FOLDER_ID], "size": str(len(payload))}
+        class Drive:
+            def download_bytes(self, file_id, maximum_bytes):
+                return payload, sidecar
+        children = {FOLDER_ID: [png, sidecar]}
+        added, holds = r.discover(Drive(), ROOT_ID, "example-store", children, [])
+        self.assertEqual(holds, [])
+        self.assertEqual(len(added), 1)
+        again, holds = r.discover(Drive(), ROOT_ID, "example-store", children, added)
+        self.assertEqual((again, holds), ([], []))
 
 
 if __name__ == "__main__":
