@@ -99,5 +99,5 @@ jobs:
         run: |
           gh api --method POST "repos/${GH_REPO}/actions/workflows/catalog-batch.yml/dispatches" \
             --input - <<'JSON'
-          {"ref":"main","inputs":{"batch_size":"250","retry_holds":"false","rebuild_manifest":"false","drain_catalog":"true"}}
+          {"ref":"main","inputs":{"batch_size":"500","retry_holds":"false","rebuild_manifest":"false","drain_catalog":"true"}}
           JSON

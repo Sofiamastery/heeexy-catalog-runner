@@ -7,6 +7,8 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from concurrent.futures import Future
 from unittest import mock
 
 
@@ -43,6 +45,8 @@ from cloud_catalog_pipeline import (  # noqa: E402
     merge_candidates,
     parse_manifest_jsonl,
     read_manifest_from_drive,
+    publish_outcomes,
+    publish_in_isolated_worker,
     preview_padding,
     prioritize_unseen_candidates,
     hold_has_untried_repair,
@@ -88,6 +92,67 @@ def whitelist_record(**overrides):
 
 
 class CloudCatalogPipelineTests(unittest.TestCase):
+    def fake_product_executor(self, results):
+        calls = []
+        class Executor:
+            def __init__(self, **kwargs):
+                self.options = kwargs
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def submit(self, fn, config, oauth, candidate, run_root, metadata):
+                calls.append(candidate)
+                future = Future()
+                result = results[candidate]
+                if isinstance(result, Exception):
+                    future.set_exception(result)
+                else:
+                    future.set_result(result)
+                return future
+        return Executor, calls
+
+    def test_parallel_outcomes_are_bounded_and_preserve_permanent_hold(self):
+        executor, calls = self.fake_product_executor({0: None, 1: ("svg_unsafe", True, ""), 2: None})
+        pending = [(index, "fingerprint", {}) for index in range(3)]
+        observed_sizes = []
+        def done_together(futures, **kwargs):
+            observed_sizes.append(len(futures))
+            return set(futures), set()
+        with mock.patch("cloud_catalog_pipeline.ProcessPoolExecutor", executor), mock.patch("cloud_catalog_pipeline.wait", done_together):
+            outcomes = list(publish_outcomes(SimpleNamespace(product_workers=2), (), pending, Path("unused"), None))
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(observed_sizes, [2, 1])
+        self.assertEqual([index for index, _ in outcomes], [0, 1, 2])
+        self.assertTrue(outcomes[1][1].permanent)
+        self.assertEqual(outcomes[1][1].code, "svg_unsafe")
+
+    def test_parallel_transient_failure_drains_started_success_without_new_work(self):
+        executor, calls = self.fake_product_executor({0: ("catalog_ingest_network_failed", False, ""), 1: None, 2: None})
+        pending = [(index, "fingerprint", {}) for index in range(3)]
+        with mock.patch("cloud_catalog_pipeline.ProcessPoolExecutor", executor), mock.patch("cloud_catalog_pipeline.wait", side_effect=lambda futures, **kwargs: ({next(iter(futures))}, set())):
+            outcomes = list(publish_outcomes(SimpleNamespace(product_workers=2), (), pending, Path("unused"), None))
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual([index for index, _ in outcomes], [0, 1])
+        self.assertIsNone(outcomes[1][1])
+        self.assertFalse(outcomes[0][1].permanent)
+
+    def test_parallel_unexpected_failure_is_sanitized_and_stops(self):
+        executor, calls = self.fake_product_executor({0: RuntimeError("private-token-url"), 1: None, 2: None})
+        pending = [(index, "fingerprint", {}) for index in range(3)]
+        with mock.patch("cloud_catalog_pipeline.ProcessPoolExecutor", executor), mock.patch("cloud_catalog_pipeline.wait", side_effect=lambda futures, **kwargs: (set(futures), set())):
+            outcomes = list(publish_outcomes(SimpleNamespace(product_workers=2), (), pending, Path("unused"), None))
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(outcomes[0][1].code, "product_worker_failed")
+        self.assertNotIn("private-token", str(outcomes))
+
+    def test_product_worker_refuses_local_before_client_or_assets(self):
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("cloud_catalog_pipeline.DriveClient") as client, mock.patch("cloud_catalog_pipeline.prepare_and_publish_candidate") as publish:
+            result = publish_in_isolated_worker(None, (), None, None, {})
+        self.assertEqual(result, ("cloud_runtime_required", False, ""))
+        client.assert_not_called()
+        publish.assert_not_called()
+
     def test_manifest_snapshot_retries_only_bounded_revision_races(self):
         drive = mock.Mock()
         def write_snapshot(file_id, path, maximum_bytes):

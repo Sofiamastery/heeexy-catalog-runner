@@ -24,6 +24,7 @@ import hashlib
 import io
 import json
 import logging
+import multiprocessing
 import os
 import re
 import subprocess
@@ -34,6 +35,7 @@ import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
@@ -413,6 +415,7 @@ class PipelineConfig:
     batch_size: int
     retry_holds: bool
     runner_temp: Path
+    product_workers: int = 1
 
 
 def canonical_json(value: Any) -> str:
@@ -2226,9 +2229,89 @@ def load_config(arguments: argparse.Namespace, runner_temp: Path) -> tuple[Pipel
             batch_size=arguments.batch_size,
             retry_holds=arguments.retry_holds,
             runner_temp=runner_temp,
+            product_workers=arguments.workers,
         ),
         oauth,
     )
+
+
+_PRODUCT_WORKER_DRIVE = None
+_PRODUCT_WORKER_CONFIG = None
+
+
+def publish_in_isolated_worker(config, oauth, candidate, run_root, source_metadata):
+    """Two bounded cloud processes: separate Pillow globals, Drive and auth.
+
+    Workers never write shared checkpoint state or leak exception payloads.
+    A process-local client/token provider is reused across product jobs.
+    """
+    global _PRODUCT_WORKER_DRIVE, _PRODUCT_WORKER_CONFIG
+    try:
+        enforce_cloud_runtime()
+        if _PRODUCT_WORKER_DRIVE is None:
+            _PRODUCT_WORKER_DRIVE = DriveClient(*oauth)
+            _PRODUCT_WORKER_CONFIG = config
+        prepare_and_publish_candidate(
+            _PRODUCT_WORKER_DRIVE, _PRODUCT_WORKER_CONFIG, candidate, run_root, source_metadata
+        )
+        return None
+    except PipelineError as error:
+        return (error.code, error.permanent, error.diagnostic)
+    except Exception:
+        return ("product_worker_failed", False, "")
+
+
+def publish_outcomes(config, oauth, pending, run_root, drive):
+    """Yield every started result; stop scheduling on the first transient error.
+
+    Only two products are ever in flight, not the whole 500-product batch.
+    Already running successes are acknowledged before the parent saves state.
+    """
+    if config.product_workers == 1:
+        for index, (candidate, _, source_metadata) in enumerate(pending):
+            error = None
+            try:
+                prepare_and_publish_candidate(drive, config, candidate, run_root, source_metadata)
+            except PipelineError as failure:
+                error = failure
+            except Exception:
+                error = PipelineError("product_worker_failed")
+            yield index, error
+            if error and not error.permanent:
+                return
+        return
+    if config.product_workers != 2:
+        raise PipelineError("product_worker_count_invalid")
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as executor:
+        in_flight = {}
+        cursor = 0
+        stopped = False
+        while in_flight or (cursor < len(pending) and not stopped):
+            while not stopped and cursor < len(pending) and len(in_flight) < 2:
+                candidate, _, source_metadata = pending[cursor]
+                try:
+                    future = executor.submit(publish_in_isolated_worker, config, oauth, candidate, run_root, source_metadata)
+                except Exception:
+                    stopped = True
+                    yield cursor, PipelineError("product_worker_failed")
+                    break
+                in_flight[future] = cursor
+                cursor += 1
+            if not in_flight:
+                break
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            outcomes = []
+            for future in sorted(done, key=lambda item: in_flight[item]):
+                index = in_flight.pop(future)
+                try:
+                    result = future.result()
+                    error = PipelineError(result[0], permanent=result[1], diagnostic=result[2]) if result else None
+                except Exception:
+                    error = PipelineError("product_worker_failed")
+                if error and not error.permanent:
+                    stopped = True
+                outcomes.append((index, error))
+            yield from outcomes
 
 
 def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter[str]:
@@ -2309,11 +2392,10 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
         raise transient_error
     with tempfile.TemporaryDirectory(prefix="heeexy-run-", dir=config.runner_temp) as run_name:
         run_root = Path(run_name)
-        for index, (candidate, fingerprint, source_metadata) in enumerate(pending, start=1):
-            try:
-                prepare_and_publish_candidate(
-                    drive, config, candidate, run_root, source_metadata
-                )
+        processed = 0
+        for index, error in publish_outcomes(config, oauth, pending, run_root, drive):
+            candidate, fingerprint, _ = pending[index]
+            if error is None:
                 completed[candidate.product_key] = {
                     "fingerprint": fingerprint,
                     "artifact_recipe_version": ARTIFACT_RECIPE_VERSION,
@@ -2321,7 +2403,7 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
                 }
                 holds.pop(candidate.product_key, None)
                 stats["published"] += 1
-            except PipelineError as error:
+            else:
                 stats[f"failed_{error.code}"] += 1
                 if error.permanent:
                     holds[candidate.product_key] = {
@@ -2333,9 +2415,9 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
                     }
                     stats["held"] += 1
                 else:
-                    transient_error = error
-                    break
-            if index % 10 == 0:
+                    transient_error = transient_error or error
+            processed += 1
+            if processed % 10 == 0:
                 state["updated_at_epoch"] = int(time.time())
                 state_file_id = drive.save_state(
                     config.reports_folder_id, state_file_id, state
@@ -2351,6 +2433,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--retry-holds", action="store_true")
+    parser.add_argument("--workers", type=int, choices=(1, 2), default=1)
     arguments = parser.parse_args(argv)
     if arguments.batch_size < 1 or arguments.batch_size > 500:
         raise PipelineError("batch_size_invalid")

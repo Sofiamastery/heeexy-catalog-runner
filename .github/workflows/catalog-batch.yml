@@ -359,7 +359,8 @@ jobs:
           GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
-          args=(--batch-size "$BATCH_SIZE")
+          # Two isolated cloud processes overlap downloads and preview work.
+          args=(--batch-size "$BATCH_SIZE" --workers 2)
           if [[ "$RETRY_HOLDS" == "true" ]]; then
             args+=(--retry-holds)
           fi
@@ -437,8 +438,8 @@ jobs:
           fi
           # Owner-approved acceleration applies only to an explicitly requested
           # drain. A one-off small pilot retains its selected size.
-          if (( SAFE_BATCH_SIZE < 250 )); then
-            SAFE_BATCH_SIZE=250
+          if (( SAFE_BATCH_SIZE < 500 )); then
+            SAFE_BATCH_SIZE=500
           fi
 
           workflow_file="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"

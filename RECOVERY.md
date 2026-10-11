@@ -38,8 +38,14 @@ in the private Drive reports folder. No SVG security checks or PNG validation
 are disabled. Product files are never downloaded to an owner's workstation.
 
 With `publish=true` and `start_drain=true`, a successful recovery starts the
-existing batch workflow with size 250, no full manifest rebuild, and no blind
+existing batch workflow with size 500, no full manifest rebuild, and no blind
 retry of held records. It safely resumes existing completed checkpoints.
+Two isolated product processes overlap rendering and network I/O on the free
+hosted runner. Each has its own Pillow state, Drive client and authentication
+provider. At most two products are in flight; only the parent writes the
+checkpoint, every ten outcomes and at batch end. On a transient error it stops
+scheduling, acknowledges already-running successes, saves, then fails safely.
+The CLI default remains one process; `--workers 1` is the rollback switch.
 Scheduled runs use the same append-only publication path and trigger a drain
 only when verified additions or unprocessed/repaired candidates remain. The
 schedule is not an exact-time service-level guarantee; GitHub may delay it.
