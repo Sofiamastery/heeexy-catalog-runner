@@ -2314,6 +2314,55 @@ def publish_outcomes(config, oauth, pending, run_root, drive):
             yield from outcomes
 
 
+def checkpoint_coverage(candidates: Sequence[Candidate], state: Mapping[str, Any]) -> dict[str, Any]:
+    """Account for this manifest only, never claim all of Drive is published."""
+    keys = {candidate.product_key for candidate in candidates}
+    completed = keys.intersection(state["completed"])
+    held = keys.intersection(state["holds"]) - completed
+    pending = keys - completed - held
+    return {"manifest_candidates": len(keys), "checkpoint_completed": len(completed),
+            "checkpoint_held": len(held), "checkpoint_unseen": len(pending),
+            "hold_reasons": dict(Counter(state["holds"][key]["reason"] for key in held)),
+            "status": "more_work" if pending else "manifest_has_holds" if held else "manifest_snapshot_settled",
+            "full_library_complete": False}
+
+
+def safe_progress(phase: str, processed: int, total: int) -> None:
+    if phase not in {"select", "publish", "resume"}:
+        raise ValueError("progress_phase_invalid")
+    print(f"catalog_progress phase={phase} processed={int(processed)} total={int(total)}", file=sys.stderr, flush=True)
+
+
+def batch_error_can_resume(error: PipelineError) -> bool:
+    if error.permanent:
+        return False
+    if error.code == "catalog_ingest_network_failed":
+        return True
+    if error.code not in {"drive_metadata_failed", "drive_list_failed", "drive_download_failed",
+                          "drive_upload_failed", "pipeline_state_write_failed"}:
+        return False
+    match = re.fullmatch(r"drive_http=(\d{3}|none) drive_reason=([a-z_,]+)", error.diagnostic)
+    if not match:
+        return False
+    status, reasons = match.groups()
+    reason_set = set(reasons.split(","))
+    if reason_set & (OAUTH_DRIVE_REASONS | HARD_DRIVE_REASONS):
+        return False
+    return status in {"408", "425", "429"} or (status.isdigit() and int(status) >= 500) or bool(reason_set & TRANSIENT_DRIVE_REASONS)
+
+
+def run_with_bounded_resume(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter[str]:
+    for attempt in range(2):
+        try:
+            return run_pipeline(config, oauth)
+        except PipelineError as error:
+            if attempt or not batch_error_can_resume(error):
+                raise
+            safe_progress("resume", 1, 1)
+            time.sleep(30)
+    raise AssertionError("unreachable")
+
+
 def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter[str]:
     stats: Counter[str] = Counter()
     drive = DriveClient(*oauth)
@@ -2351,7 +2400,10 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
     pending: list[tuple[Candidate, str, dict[str, dict[str, Any]]]] = []
     source_metadata_cache: dict[str, dict[str, Any]] = {}
     transient_error: PipelineError | None = None
-    for candidate in candidates:
+    safe_progress("select", 0, len(candidates))
+    for candidate_index, candidate in enumerate(candidates):
+        if candidate_index and candidate_index % 250 == 0:
+            safe_progress("select", candidate_index, len(candidates))
         try:
             fingerprint, source_metadata = resolve_candidate_artifact_fingerprint(
                 drive, candidate, source_metadata_cache
@@ -2390,6 +2442,7 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
         state["updated_at_epoch"] = int(time.time())
         drive.save_state(config.reports_folder_id, state_file_id, state)
         raise transient_error
+    safe_progress("publish", 0, len(pending))
     with tempfile.TemporaryDirectory(prefix="heeexy-run-", dir=config.runner_temp) as run_name:
         run_root = Path(run_name)
         processed = 0
@@ -2418,12 +2471,16 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
                     transient_error = transient_error or error
             processed += 1
             if processed % 10 == 0:
+                safe_progress("publish", processed, len(pending))
                 state["updated_at_epoch"] = int(time.time())
+                state["coverage"] = checkpoint_coverage(candidates, state)
                 state_file_id = drive.save_state(
                     config.reports_folder_id, state_file_id, state
                 )
     state["updated_at_epoch"] = int(time.time())
+    state["coverage"] = checkpoint_coverage(candidates, state)
     drive.save_state(config.reports_folder_id, state_file_id, state)
+    safe_progress("publish", processed, len(pending))
     if transient_error:
         raise transient_error
     return stats
@@ -2468,7 +2525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runner_temp = enforce_cloud_runtime()
         arguments = parse_arguments(list(argv if argv is not None else sys.argv[1:]))
         config, oauth = load_config(arguments, runner_temp)
-        stats = run_pipeline(config, oauth)
+        stats = run_with_bounded_resume(config, oauth)
         print(f"pipeline_status=ok {safe_summary(stats)}", flush=True)
         return 0
     except PipelineError as error:

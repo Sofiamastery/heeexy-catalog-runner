@@ -24,9 +24,11 @@ import xml.etree.ElementTree as ET
 try:
     from scripts import cloud_catalog_manifest as m
     from scripts import cloud_catalog_pipeline as p
+    from scripts import cloud_catalog_svg_recovery as svg_recovery
 except ImportError:
     import cloud_catalog_manifest as m
     import cloud_catalog_pipeline as p
+    import cloud_catalog_svg_recovery as svg_recovery
 
 REPORT_ROLE = "catalog_recovery_report_v1"
 REPORT_NAME = "catalog-recovery-report.json"
@@ -365,6 +367,9 @@ def main():
         state, _ = drive.load_state(reports_id)
         folders, children, stats = scan_tree(client, root_id)
         additions, holds = discover_parallel(client, root_id, namespace, children, previous)
+        png_additions = list(additions)
+        svg_additions, svg_report = svg_recovery.discover(client, env, previous + additions, source_ids)
+        additions.extend(svg_additions)
         union = append_only_union(previous, additions)
         png_inventory = {item["id"] for items in children.values() for item in items if item.get("mimeType") == p.PNG_MIME}
         known_png = set()
@@ -378,7 +383,7 @@ def main():
                     published_png.add(candidate.source_png_id)
                 elif candidate.product_key in state["holds"]:
                     held_png.add(candidate.source_png_id)
-        new_png = {record["assets"]["png_drive_file_id"] for record in additions}
+        new_png = {record["assets"]["png_drive_file_id"] for record in png_additions}
         report = {"generated_at": datetime.now(timezone.utc).isoformat(), "mode": "publish" if args.publish else "audit",
             "inventory": dict(stats), "previous_records": len(previous), "new_verified_records": len(additions),
             "union_records": len(union), "previous_completed": len(state["completed"]),
@@ -388,6 +393,7 @@ def main():
                 "unassociated_png_files_not_unique_products": len(png_inventory - known_png - new_png)},
             "sidecar_holds": holds, "sidecar_hold_reasons": dict(Counter(item["reason"] for item in holds)),
             "additions": additions,
+            "svg_recovery": svg_report,
             "unassociated_png_ids": sorted(png_inventory - known_png - new_png),
             "full_library_complete": False, "published": False}
         report["manifest_baseline_modified_time"] = baseline

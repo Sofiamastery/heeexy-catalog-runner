@@ -52,16 +52,16 @@ jobs:
           set -euo pipefail
           [[ -n "$EXPECTED_REPOSITORY" && "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
           [[ "$GITHUB_REF" == "refs/heads/main" && "$ACTIONS_RETENTION_DAYS" == "1" ]]
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
       - name: Install ephemeral runtime
         run: python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
       - name: Validate append-only recovery
-        run: python -B -m unittest scripts/cloud_catalog_recovery_test.py scripts/repository_safety_test.py
+        run: python -B -m unittest scripts/cloud_catalog_recovery_test.py scripts/cloud_catalog_svg_recovery_test.py scripts/cloud_catalog_resume_test.py scripts/repository_safety_test.py
       - name: Reconcile private Drive catalog
         id: reconcile
         env:
@@ -71,6 +71,8 @@ jobs:
           HEEEXY_REPORTS_FOLDER_ID: ${{ secrets.REPORTS_FOLDER_ID }}
           HEEEXY_CATALOG_METADATA_FOLDER_ID: ${{ secrets.CATALOG_METADATA_FOLDER_ID }}
           HEEEXY_CATALOG_SOURCE_NAMESPACE: ${{ secrets.CATALOG_SOURCE_NAMESPACE }}
+          HEEEXY_SVG_RECOVERY_LEDGER_ID: ${{ secrets.SVG_RECOVERY_LEDGER_ID }}
+          HEEEXY_SVG_RECOVERY_LEDGER_SHA256: ${{ secrets.SVG_RECOVERY_LEDGER_SHA256 }}
           GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
           GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
           GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
