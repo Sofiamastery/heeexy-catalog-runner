@@ -19,6 +19,15 @@ def safe_line(**overrides: int) -> str:
 
 
 class CloudCatalogBatchSummaryTests(unittest.TestCase):
+    def test_short_new_batch_continues_to_revision_audit(self) -> None:
+        _, selected, continue_required = summary.parse_summary(
+            safe_line(selected=12, published=12, verification_deferred=1).encode(), 500)
+        self.assertEqual(selected, 12)
+        self.assertTrue(continue_required)
+        for payload in (safe_line(verification_deferred=1), safe_line(selected=1, published=1, verification_deferred=2)):
+            with self.assertRaises(summary.BatchSummaryError):
+                summary.parse_summary(payload.encode(), 500)
+
     def test_valid_summary_exposes_only_bounded_continuation_outputs(self) -> None:
         line, selected, batch_full = summary.parse_summary(
             (safe_line(selected=500, published=499, held=1, failed=1) + "\n").encode(),

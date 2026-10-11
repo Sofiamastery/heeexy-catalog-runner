@@ -23,6 +23,7 @@ SUMMARY_FIELDS = (
     "published",
     "selected",
     "unchanged_hold",
+    "verification_deferred",
     "failed",
 )
 SUMMARY_PATTERN = re.compile(
@@ -65,6 +66,8 @@ def parse_summary(payload: bytes, batch_size: int) -> tuple[str, int, bool]:
         raise BatchSummaryError("pipeline_selected_invalid")
     if (
         values["candidate_conflicts"] != 0
+        or values["verification_deferred"] not in {0, 1}
+        or (values["verification_deferred"] and selected == 0)
         or values["failed"] != values["held"]
         or values["published"] > selected
         # Permanent fingerprint failures are held before batch selection, so
@@ -77,7 +80,9 @@ def parse_summary(payload: bytes, batch_size: int) -> tuple[str, int, bool]:
         > values["manifest_accepted"] + values["discovery_accepted"]
     ):
         raise BatchSummaryError("pipeline_summary_semantics_invalid")
-    return line.rstrip("\r\n"), selected, selected == batch_size
+    # Keep the historical workflow output name for compatibility. It now means
+    # continuation required: a full batch OR a deferred source-revision audit.
+    return line.rstrip("\r\n"), selected, selected == batch_size or bool(values["verification_deferred"])
 
 
 def write_github_outputs(path: Path, selected: int, batch_size: int, batch_full: bool) -> None:

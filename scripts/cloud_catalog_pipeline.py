@@ -2415,6 +2415,10 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
     state, state_file_id = drive.load_state(config.reports_folder_id)
     completed: dict[str, Any] = state["completed"]
     holds: dict[str, Any] = state["holds"]
+    new_work_keys = {candidate.product_key for candidate in candidates
+                     if candidate.product_key not in completed
+                     and (candidate.product_key not in holds or config.retry_holds
+                          or hold_has_untried_repair(holds[candidate.product_key]))}
     candidates = prioritize_unseen_candidates(
         candidates,
         completed,
@@ -2426,6 +2430,11 @@ def run_pipeline(config: PipelineConfig, oauth: tuple[str, str, str]) -> Counter
     transient_error: PipelineError | None = None
     safe_progress("select", 0, len(candidates))
     for candidate_index, candidate in enumerate(candidates):
+        if pending and new_work_keys and candidate.product_key not in new_work_keys:
+            # Publish a short new-work batch now. An explicit continuation flag
+            # guarantees the old-source revision audit runs on a fresh batch.
+            stats["verification_deferred"] = 1
+            break
         if candidate_index % 128 == 0:
             warm_candidate_metadata(lambda: DriveClient(*oauth),
                                     candidates[candidate_index:candidate_index + 128], source_metadata_cache)
@@ -2537,6 +2546,7 @@ def safe_summary(stats: Mapping[str, int]) -> str:
         "manifest_ignored",
         "discovery_sidecars_in_scope",
         "discovery_accepted",
+        "verification_deferred",
     }
     fields = [f"{key}={int(stats.get(key, 0))}" for key in sorted(allowed)]
     failed = sum(value for key, value in stats.items() if key.startswith("failed_"))
