@@ -1914,22 +1914,25 @@ def prepare_and_publish_candidate(
         archive_svg = False
 
         if candidate.source_archive_id:
-            archive_path = work_dir / "source-archive.zip"
-            archive_metadata = drive.download_to(
-                candidate.source_archive_id,
-                archive_path,
-                MAX_ARCHIVE_BYTES,
-                candidate_scoped=True,
-                expected_metadata=source_metadata.get(candidate.source_archive_id),
-            )
+            # Range extraction on the hosted runner avoids fetching the same
+            # whole bundle separately for every product. Existing ZIP safety
+            # guards still validate exact paths, sizes, encryption and CRCs.
+            try:
+                from scripts.cloud_catalog_archive_recovery import extract_selected
+            except ImportError:
+                from cloud_catalog_archive_recovery import extract_selected
+            archive_metadata = source_metadata.get(candidate.source_archive_id) or drive.get_metadata(
+                candidate.source_archive_id, candidate_scoped=True)
+            if archive_metadata.get("id") != candidate.source_archive_id or archive_metadata.get("trashed"):
+                raise PipelineError("archive_source_identity_invalid", permanent=True)
             if archive_metadata.get("mimeType") not in {
                 ZIP_MIME,
                 "application/x-zip-compressed",
                 "application/octet-stream",
             }:
                 raise PipelineError("archive_mime_invalid", permanent=True)
-            archive_png, archive_svg = extract_archive_members(
-                archive_path,
+            archive_png, archive_svg = extract_selected(
+                drive, archive_metadata,
                 png_member=candidate.archive_png_member,
                 svg_member=candidate.archive_svg_member,
                 png_destination=png_path,

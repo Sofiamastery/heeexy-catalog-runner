@@ -37,8 +37,12 @@ MAX_SIDECAR_BYTES = 256 * 1024
 
 def source_ids(record):
     assets = record.get("assets", {})
-    return {value for key, value in assets.items()
+    sources = {value for key, value in assets.items()
             if key in {"png_drive_file_id", "svg_drive_file_id"} and value}
+    archive_id = assets.get("archive_drive_file_id")
+    if archive_id:
+        sources.update(f"archive:{archive_id}:{assets[key]}" for key in ("archive_svg_member", "archive_png_member") if assets.get(key))
+    return sources
 
 
 def append_only_union(previous, additions):

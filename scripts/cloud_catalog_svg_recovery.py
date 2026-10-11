@@ -14,9 +14,11 @@ import re
 try:
     from scripts import cloud_catalog_manifest as m
     from scripts import cloud_catalog_pipeline as p
+    from scripts import cloud_catalog_archive_recovery as archives
 except ImportError:
     import cloud_catalog_manifest as m
     import cloud_catalog_pipeline as p
+    import cloud_catalog_archive_recovery as archives
 
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_LEDGER_ROWS = 30_000
@@ -116,8 +118,16 @@ def discover(client_for_thread, env, previous, source_ids):
         for accepted, rejected in executor.map(verify, seeds):
             records.extend(accepted)
             holds.extend(rejected)
+    archive_records, archive_report = archives.discover(client_for_thread, payload, namespace, claimed)
+    records.extend(archive_records)
+    # Replace the old generic archive exclusion with its exact disposition.
+    archive_identities = {json.loads(line)["identity"] for line in payload.decode("utf-8-sig").splitlines()
+        if line.strip() and json.loads(line).get("source_kind") == "archive_svg_member"}
+    holds = [hold for hold in holds if hold["identity"] not in archive_identities]
+    holds.extend(archive_report["holds"])
     report = {"configured": True, "counts": dict(stats), "new_verified_records": len(records),
+        "archive_recovery": archive_report,
         "holds": holds, "hold_reasons": dict(Counter(reason for hold in holds for reason in hold["reasons"])),
         "full_library_complete": False,
-        "scope": "Recovered metadata rows only. Unrecovered identities and archive members require separate reconciliation."}
+        "scope": "Recovered metadata rows only. Unrecovered identities and unresolved archive members remain held."}
     return records, report

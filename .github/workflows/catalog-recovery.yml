@@ -61,7 +61,7 @@ jobs:
       - name: Install ephemeral runtime
         run: python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
       - name: Validate append-only recovery
-        run: python -B -m unittest scripts/cloud_catalog_recovery_test.py scripts/cloud_catalog_svg_recovery_test.py scripts/cloud_catalog_resume_test.py scripts/repository_safety_test.py
+        run: python -B -m unittest scripts/cloud_catalog_recovery_test.py scripts/cloud_catalog_svg_recovery_test.py scripts/cloud_catalog_archive_recovery_test.py scripts/cloud_catalog_resume_test.py scripts/repository_safety_test.py
       - name: Reconcile private Drive catalog
         id: reconcile
         env:
