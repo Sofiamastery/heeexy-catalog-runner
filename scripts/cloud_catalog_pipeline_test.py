@@ -45,6 +45,9 @@ from cloud_catalog_pipeline import (  # noqa: E402
     preview_padding,
     prioritize_unseen_candidates,
     hold_has_untried_repair,
+    png_dimensions_allowed,
+    bounded_preview_source,
+    verify_png,
     public_site_metadata,
     safe_summary,
     source_revision_descriptor,
@@ -565,7 +568,41 @@ class CloudCatalogPipelineTests(unittest.TestCase):
     def test_diagnosed_hold_repair_retries_once_only(self):
         self.assertTrue(hold_has_untried_repair({"reason": "svg_namespace_not_allowed"}))
         self.assertFalse(hold_has_untried_repair({"reason": "svg_namespace_not_allowed", "repair_version": "c2pa-inert-metadata-v1"}))
-        self.assertFalse(hold_has_untried_repair({"reason": "png_decode_failed"}))
+        self.assertTrue(hold_has_untried_repair({"reason": "png_decode_failed"}))
+        self.assertFalse(hold_has_untried_repair({"reason": "png_decode_failed", "repair_version": "svg-preview-large-original-v1"}))
+        self.assertFalse(hold_has_untried_repair({"reason": "source_asset_missing"}))
+
+    def test_large_original_bounds_and_bounded_svg_preview(self):
+        self.assertFalse(png_dimensions_allowed(18_184, 18_184))
+        self.assertTrue(png_dimensions_allowed(18_184, 18_184, 400_000_000))
+        self.assertFalse(png_dimensions_allowed(20_001, 100, 400_000_000))
+        original, svg, work = Path("original.png"), Path("original.svg"), Path("work")
+        with mock.patch("cloud_catalog_pipeline.render_svg") as render:
+            result = bounded_preview_source(original, svg, (18_184, 18_184), work)
+            self.assertNotEqual(result, original)
+            render.assert_called_once_with(svg, result, work)
+        with self.assertRaisesRegex(PipelineError, "large_png_requires_svg_preview"):
+            bounded_preview_source(original, None, (18_184, 18_184), work)
+        self.assertEqual(bounded_preview_source(original, None, (3000, 3000), work), original)
+
+    def test_large_delivery_verification_never_decodes_pixels_or_disables_preview_guard(self):
+        from PIL import Image
+        image = mock.MagicMock()
+        image.format = "PNG"
+        image.size = (18_184, 18_184)
+        image.__enter__.return_value = image
+        with mock.patch("PIL.Image.open", return_value=image):
+            self.assertEqual(verify_png(Path("original.png"), allow_large_delivery=True), image.size)
+            image.verify.assert_called_once()
+            image.load.assert_not_called()
+            image.convert.assert_not_called()
+            self.assertEqual(Image.MAX_IMAGE_PIXELS, 100_000_000)
+            with self.assertRaisesRegex(PipelineError, "png_dimensions_invalid"):
+                verify_png(Path("original.png"))
+        image.verify.side_effect = ValueError("synthetic invalid CRC")
+        with mock.patch("PIL.Image.open", return_value=image):
+            with self.assertRaisesRegex(PipelineError, "png_decode_failed"):
+                verify_png(Path("original.png"), allow_large_delivery=True)
 
     def test_drive_http_errors_separate_file_holds_from_service_stops(self):
         class FakeResponse:

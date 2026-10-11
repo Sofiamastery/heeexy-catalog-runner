@@ -59,9 +59,14 @@ MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_METADATA_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_PIXELS = 100_000_000
+MAX_DELIVERY_IMAGE_PIXELS = 400_000_000
 # Only these diagnosed failures get one automatic retry after a code fix.
 # A failed retry records this version and is not retried on every drain.
-HOLD_REPAIR_VERSIONS = {"svg_namespace_not_allowed": "c2pa-inert-metadata-v1"}
+HOLD_REPAIR_VERSIONS = {
+    "svg_namespace_not_allowed": "c2pa-inert-metadata-v1",
+    "png_decode_failed": "svg-preview-large-original-v1",
+    "png_dimensions_invalid": "svg-preview-large-original-v1",
+}
 MAX_ARCHIVE_ENTRIES = 50_000
 MAX_SVG_ELEMENTS = 250_000
 MAX_TITLE_CHARS = 256
@@ -1571,24 +1576,49 @@ def discover_png_only_candidates(
     return sorted(candidates.values(), key=lambda item: item.product_key), stats
 
 
-def verify_png(path: Path) -> tuple[int, int]:
+def verify_png(path: Path, *, allow_large_delivery: bool = False) -> tuple[int, int]:
+    """Check PNG format/chunk integrity without allocating decoded pixels.
+
+    Larger originals are permitted only with a validated SVG twin. They are
+    delivered unchanged; their pixels are never passed to the preview decoder.
+    """
     try:
         from PIL import Image
 
-        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        maximum_pixels = MAX_DELIVERY_IMAGE_PIXELS if allow_large_delivery else MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = maximum_pixels
         with Image.open(path) as image:
             if image.format != "PNG":
                 raise PipelineError("png_format_invalid", permanent=True)
-            image.verify()
-        with Image.open(path) as image:
             width, height = image.size
+            if not png_dimensions_allowed(width, height, maximum_pixels):
+                raise PipelineError("png_dimensions_invalid", permanent=True)
+            image.verify()
     except PipelineError:
         raise
     except Exception as error:
         raise PipelineError("png_decode_failed", permanent=True) from error
-    if width < 1 or height < 1 or width > 20_000 or height > 20_000 or width * height > MAX_IMAGE_PIXELS:
-        raise PipelineError("png_dimensions_invalid", permanent=True)
+    finally:
+        # The normal raster decoder always retains the tighter guard.
+        try:
+            Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        except UnboundLocalError:
+            pass
     return width, height
+
+
+def png_dimensions_allowed(width: int, height: int, maximum_pixels: int = MAX_IMAGE_PIXELS) -> bool:
+    return 0 < width <= 20_000 and 0 < height <= 20_000 and width * height <= maximum_pixels
+
+
+def bounded_preview_source(png_path: Path, svg_path: Path | None, dimensions: tuple[int, int], work_dir: Path) -> Path:
+    if dimensions[0] * dimensions[1] <= MAX_IMAGE_PIXELS:
+        return png_path
+    if svg_path is None:
+        raise PipelineError("large_png_requires_svg_preview", permanent=True)
+    preview_source = work_dir / "bounded-preview-source.png"
+    render_svg(svg_path, preview_source, work_dir)
+    return preview_source
 
 
 def render_svg(svg_path: Path, png_path: Path, work_dir: Path) -> None:
@@ -1932,10 +1962,11 @@ def prepare_and_publish_candidate(
         elif not has_png:
             raise PipelineError("source_asset_missing", permanent=True)
 
-        width, height = verify_png(png_path)
+        width, height = verify_png(png_path, allow_large_delivery=has_svg)
         png_hash = sha256_path(png_path)
         svg_hash = sha256_path(svg_path) if has_svg else None
-        white, dark, transparency = create_previews(png_path, work_dir)
+        preview_source = bounded_preview_source(png_path, svg_path if has_svg else None, (width, height), work_dir)
+        white, dark, transparency = create_previews(preview_source, work_dir)
         product_folder_id = drive.ensure_product_folder(
             config.product_zips_folder_id, candidate.product_hash, candidate.slug
         )
