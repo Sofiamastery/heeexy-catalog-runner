@@ -430,6 +430,11 @@ jobs:
             echo "::error::Continuation received an invalid batch size."
             exit 2
           fi
+          # Owner-approved acceleration applies only to an explicitly requested
+          # drain. A one-off small pilot retains its selected size.
+          if (( SAFE_BATCH_SIZE < 250 )); then
+            SAFE_BATCH_SIZE=250
+          fi
 
           workflow_file="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
           workflow_file="${workflow_file%@*}"
