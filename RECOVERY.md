@@ -28,7 +28,7 @@ in the private Drive reports folder. No SVG security checks or PNG validation
 are disabled. Product files are never downloaded to an owner's workstation.
 
 With `publish=true` and `start_drain=true`, a successful recovery starts the
-existing batch workflow with size 100, no full manifest rebuild, and no blind
+existing batch workflow with size 250, no full manifest rebuild, and no blind
 retry of held records. It safely resumes existing completed checkpoints.
 
 Do not enable an older full-rebuild schedule without reconciling the added
