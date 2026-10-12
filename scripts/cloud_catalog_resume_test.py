@@ -9,6 +9,16 @@ from scripts import cloud_catalog_pipeline as p
 
 
 class ResumeTests(unittest.TestCase):
+    def test_each_site_keeps_its_own_checkpoint(self):
+        legacy = p.state_identity("https://shop.example.chatgpt.site")
+        self.assertEqual(legacy, (p.STATE_ROLE, p.STATE_FILE_NAME))
+        self.assertEqual(p.state_identity(""), legacy)
+        first = p.state_identity("https://one.example.com")
+        self.assertNotEqual(first, legacy)
+        self.assertEqual(first, p.state_identity("https://ONE.example.com/"))
+        self.assertNotEqual(first, p.state_identity("https://two.example.com"))
+        self.assertLessEqual(len("heeexy_role" + first[0]), 124)
+
     def test_short_batch_publishes_before_old_audit_and_next_run_finishes_audit(self):
         candidates = [SimpleNamespace(product_key="old", fingerprint="seed-old"),
                       SimpleNamespace(product_key="new", fingerprint="seed-new")]

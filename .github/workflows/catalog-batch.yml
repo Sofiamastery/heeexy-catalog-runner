@@ -360,7 +360,7 @@ jobs:
         run: |
           set -euo pipefail
           # Two isolated cloud processes overlap downloads and preview work.
-          args=(--batch-size "$BATCH_SIZE" --workers 2)
+          args=(--batch-size "$BATCH_SIZE" --workers 4)
           if [[ "$RETRY_HOLDS" == "true" ]]; then
             args+=(--retry-holds)
           fi

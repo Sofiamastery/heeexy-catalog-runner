@@ -83,6 +83,8 @@ DRIVE_RESUMABLE_RETRY_DELAYS = (1, 2, 4, 8)
 DRIVE_RECONCILE_DELAYS = (1, 2, 4, 8)
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
 STATE_ROLE = "catalog_pipeline_state_v1"
+STATE_FILE_NAME = "catalog-pipeline-state.json"
+MAX_PRODUCT_WORKERS = 4
 PRODUCT_FOLDER_ROLE = "catalog_product_folder_v1"
 DELIVERY_ROLE = "delivery_zip_v1"
 RENDERED_PNG_ROLE = "rendered_png_v1"
@@ -1329,8 +1331,9 @@ class DriveClient:
             raise classified from error
 
     def load_state(self, reports_folder_id: str) -> tuple[dict[str, Any], str | None]:
+        role, _ = state_identity()
         found = self._find_by_properties(
-            reports_folder_id, {"heeexy_role": STATE_ROLE}
+            reports_folder_id, {"heeexy_role": role}
         )
         if not found:
             return empty_state(), None
@@ -1344,6 +1347,7 @@ class DriveClient:
         return state, state_file["id"]
 
     def save_state(self, reports_folder_id: str, state_file_id: str | None, state: dict[str, Any]) -> str:
+        role, name = state_identity()
         payload = (canonical_json(state) + "\n").encode("utf-8")
         try:
             from googleapiclient.http import MediaIoBaseUpload
@@ -1365,9 +1369,9 @@ class DriveClient:
                     self.service.files()
                     .create(
                         body={
-                            "name": "catalog-pipeline-state.json",
+                            "name": name,
                             "parents": [reports_folder_id],
-                            "appProperties": {"heeexy_role": STATE_ROLE},
+                            "appProperties": {"heeexy_role": role},
                         },
                         media_body=media,
                         fields="id",
@@ -1399,6 +1403,20 @@ def resolve_candidate_artifact_fingerprint(
     if not revisions:
         raise PipelineError("asset_identity_missing", permanent=True)
     return artifact_fingerprint(candidate, revisions), selected_metadata
+
+
+def state_identity(site_base_url: str | None = None) -> tuple[str, str]:
+    """Each publishing target owns its checkpoint; the first site keeps the original.
+
+    A checkpoint records what one site has received. Reusing it for another
+    site would mark every product complete there without publishing anything.
+    """
+    value = os.environ.get("HEEEXY_SITE_BASE_URL", "") if site_base_url is None else site_base_url
+    host = (urlsplit(value.strip()).hostname or "").casefold()
+    if not host or host.endswith(".chatgpt.site"):
+        return STATE_ROLE, STATE_FILE_NAME
+    target = hashlib.sha256(host.encode("utf-8")).hexdigest()[:16]
+    return f"{STATE_ROLE}_{target}", f"catalog-pipeline-state-{target}.json"
 
 
 def empty_state() -> dict[str, Any]:
@@ -2268,7 +2286,7 @@ def publish_in_isolated_worker(config, oauth, candidate, run_root, source_metada
 def publish_outcomes(config, oauth, pending, run_root, drive):
     """Yield every started result; stop scheduling on the first transient error.
 
-    Only two products are ever in flight, not the whole 500-product batch.
+    Only one product per worker is ever in flight, not the whole 500-product batch.
     Already running successes are acknowledged before the parent saves state.
     """
     if config.product_workers == 1:
@@ -2284,14 +2302,15 @@ def publish_outcomes(config, oauth, pending, run_root, drive):
             if error and not error.permanent:
                 return
         return
-    if config.product_workers != 2:
+    workers = config.product_workers
+    if workers < 2 or workers > MAX_PRODUCT_WORKERS:
         raise PipelineError("product_worker_count_invalid")
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as executor:
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
         in_flight = {}
         cursor = 0
         stopped = False
         while in_flight or (cursor < len(pending) and not stopped):
-            while not stopped and cursor < len(pending) and len(in_flight) < 2:
+            while not stopped and cursor < len(pending) and len(in_flight) < workers:
                 candidate, _, source_metadata = pending[cursor]
                 try:
                     future = executor.submit(publish_in_isolated_worker, config, oauth, candidate, run_root, source_metadata)
@@ -2529,7 +2548,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--retry-holds", action="store_true")
-    parser.add_argument("--workers", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--workers", type=int, choices=tuple(range(1, MAX_PRODUCT_WORKERS + 1)), default=1)
     arguments = parser.parse_args(argv)
     if arguments.batch_size < 1 or arguments.batch_size > 500:
         raise PipelineError("batch_size_invalid")
