@@ -97,6 +97,16 @@ INCREMENTAL_OWNER_APPROVAL_RE = re.compile(
 INCREMENTAL_AUTO_APPROVABLE_VALUES = frozenset(
     {"", "pending", "owner_pending", "needs_review", "review", "awaiting_approval"}
 )
+# Under the owner's auto-approve policy only an explicit refusal still holds.
+INCREMENTAL_REFUSAL_RE = re.compile(r"(reject|denied|deny|declin|block|remove|delete|do_not|dont|not_approved|^no$)")
+# Columns that must exist even under auto-approve; the rest may be absent.
+INCREMENTAL_AUTO_APPROVE_REQUIRED_COLUMNS = frozenset(
+    {"deliveryfile", "etsytitle", "etsydescription", "etsytags"}
+)
+
+
+def _png_only_auto_approve() -> bool:
+    return os.environ.get("HEEEXY_PNG_ONLY_AUTO_APPROVE", "").strip().lower() == "true"
 INCREMENTAL_PENDING_DRIVE_VALUES = frozenset(
     {"", "connector_upload_pending", "pending"}
 )
@@ -2675,7 +2685,12 @@ def _incremental_sidecar_row(payload: bytes) -> dict[str, str]:
         headers = [normalize_text(value).casefold() for value in raw_headers]
         if any(not value for value in headers) or len(set(headers)) != len(headers):
             raise ManifestBuilderError("incremental_sidecar_headers_invalid")
-        if not INCREMENTAL_SIDECAR_REQUIRED_COLUMNS.issubset(headers):
+        required_columns = (
+            INCREMENTAL_AUTO_APPROVE_REQUIRED_COLUMNS
+            if _png_only_auto_approve()
+            else INCREMENTAL_SIDECAR_REQUIRED_COLUMNS
+        )
+        if not required_columns.issubset(headers):
             raise ManifestBuilderError("incremental_sidecar_contract_columns_missing")
         rows: list[dict[str, str]] = []
         for raw_row in reader:
@@ -2761,22 +2776,25 @@ def parse_incremental_product_sidecar(
         raise ManifestBuilderError("incremental_sidecar_parent_invalid")
 
     row = _incremental_sidecar_row(payload)
+    for optional in ("ownerapproval", "etsystage", "deliverykind"):
+        row.setdefault(optional, "")
     approval = normalize_text(row["ownerapproval"]).casefold()
     # Owner policy (2026-10-14): every design uploaded to PNG Only should go
     # live automatically. With HEEEXY_PNG_ONLY_AUTO_APPROVE=true an empty or
     # pending approval/stage counts as approved; titles, descriptions, tags and
     # exact file checks below still apply.
-    auto_approve = os.environ.get("HEEEXY_PNG_ONLY_AUTO_APPROVE", "").strip().lower() == "true"
+    auto_approve = _png_only_auto_approve()
     approved = approval in {"approved", "owner_approved"} or bool(
         INCREMENTAL_OWNER_APPROVAL_RE.fullmatch(approval)
     )
-    if not approved and not (auto_approve and approval in INCREMENTAL_AUTO_APPROVABLE_VALUES):
+    if not approved and not (auto_approve and not INCREMENTAL_REFUSAL_RE.search(approval)):
         raise ManifestBuilderError("incremental_sidecar_owner_approval_invalid")
-    if normalize_text(row["deliverykind"]).casefold() != "transparent_png":
+    delivery_kind = normalize_text(row["deliverykind"]).casefold()
+    if delivery_kind != "transparent_png" and not (auto_approve and delivery_kind in {"", "png"}):
         raise ManifestBuilderError("incremental_sidecar_delivery_kind_invalid")
     etsy_stage = normalize_text(row["etsystage"]).casefold()
     if etsy_stage != "active_verified" and not (
-        auto_approve and etsy_stage in INCREMENTAL_AUTO_APPROVABLE_VALUES | {"draft", "active", "inactive", "verified"}
+        auto_approve and not INCREMENTAL_REFUSAL_RE.search(etsy_stage)
     ):
         raise ManifestBuilderError("incremental_sidecar_etsy_stage_invalid")
     delivery_name = normalize_text(row["deliveryfile"])

@@ -1745,10 +1745,15 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
         try:
             self.assertEqual(self._scan_with_approval("", "").hold_reasons, ())
             self.assertEqual(self._scan_with_approval("pending", "draft").hold_reasons, ())
-            # Unknown approval words are still refused.
+            self.assertEqual(self._scan_with_approval("waiting_for_owner", "listed").hold_reasons, ())
+            # Explicit refusals are still held.
             self.assertIn(
                 "incremental_sidecar_owner_approval_invalid",
                 self._scan_with_approval("rejected").hold_reasons,
+            )
+            self.assertIn(
+                "incremental_sidecar_etsy_stage_invalid",
+                self._scan_with_approval("approved", "removed").hold_reasons,
             )
         finally:
             os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
