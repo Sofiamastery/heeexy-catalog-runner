@@ -209,7 +209,9 @@ jobs:
           python -B scripts/cloud_catalog_manifest.py
 
       - name: Verify the private publication report without exposing its contents
-        if: ${{ steps.authorize.outputs.should_rebuild == 'true' }}
+        # Also after a failed refresh: the aggregate counters explain why the
+        # publication gate held (e.g. new Drive designs without metadata).
+        if: ${{ always() && steps.authorize.outputs.should_rebuild == 'true' }}
         shell: bash
         env:
           RUNNER_ENVIRONMENT: github-hosted
