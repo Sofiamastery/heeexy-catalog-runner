@@ -250,6 +250,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"publication_eligible={'true' if eligible else 'false'}",
             flush=True,
         )
+        # Only when the gate holds: aggregate counters (the parser above
+        # allowlists numeric fields) explain why, without product rows, file
+        # ids or hashes.
+        if not eligible:
+            print(
+                "manifest_report_counters="
+                + json.dumps(
+                    {
+                        "publication_gate": summary.get("publication_gate"),
+                        "reconciliation": summary.get("reconciliation"),
+                        "inventory": summary.get("inventory"),
+                        "manifest": summary.get("manifest"),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         return 0
     except (ReportSummaryError, manifest.ManifestBuilderError, pipeline.PipelineError) as error:
         print(
