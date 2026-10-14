@@ -1717,6 +1717,66 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
         self.assertEqual(len(reconciled.records), 1)
         self.assertEqual(reconciled.holds, [])
 
+    def _scan_with_approval(self, owner_approval, etsy_stage="ACTIVE_VERIFIED"):
+        payload = incremental_sidecar_bytes(
+            PNG_SHA256="a" * 64,
+            DriveProductFolderID=self.FOLDER_A,
+            DrivePNGFileID=self.PNG_A,
+            owner_approval=owner_approval,
+            etsy_stage=etsy_stage,
+        )
+        sidecar = self.sidecar(self.SIDECAR_A, self.FOLDER_A, payload)
+        children = {
+            PNG_ROOT_ID: [self.folder(self.FOLDER_A, "New Product")],
+            self.FOLDER_A: [self.png(self.PNG_A, "New Design.png", self.FOLDER_A), sidecar],
+        }
+        _, _, seeds, _ = self.scan(children, {self.SIDECAR_A: (payload, sidecar)})
+        return seeds[0]
+
+    def test_pending_owner_approval_is_held_without_auto_approve_policy(self):
+        import os
+        os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+        seed = self._scan_with_approval("pending", "draft")
+        self.assertIn("incremental_sidecar_owner_approval_invalid", seed.hold_reasons)
+
+    def test_owner_auto_approve_policy_accepts_pending_png_only_uploads(self):
+        import os
+        os.environ["HEEEXY_PNG_ONLY_AUTO_APPROVE"] = "true"
+        try:
+            self.assertEqual(self._scan_with_approval("", "").hold_reasons, ())
+            self.assertEqual(self._scan_with_approval("pending", "draft").hold_reasons, ())
+            # Unknown approval words are still refused.
+            self.assertIn(
+                "incremental_sidecar_owner_approval_invalid",
+                self._scan_with_approval("rejected").hold_reasons,
+            )
+        finally:
+            os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+
+    def test_append_only_manifest_keeps_previous_records_and_adds_new_ones(self):
+        def record(identity, title):
+            return {
+                "schema_version": manifest.MANIFEST_SCHEMA_VERSION,
+                "record_type": "heeexy_catalog_product",
+                "product_identity": identity,
+                "title": title,
+            }
+        old_a = "gdrive:v3:" + "a" * 64
+        old_b = "gdrive:v3:" + "b" * 64
+        new_c = "gdrive:v3:" + "c" * 64
+        previous = manifest.render_manifest_jsonl([record(old_a, "A"), record(old_b, "B")])
+        # Current build lost B (e.g. legacy inventory issue) and found new C.
+        payload, added = manifest.append_only_manifest(
+            previous, [record(old_a, "A changed"), record(new_c, "C")]
+        )
+        self.assertEqual(added, 1)
+        rows = [json.loads(line) for line in payload.decode().splitlines()]
+        self.assertEqual([row["product_identity"] for row in rows], [old_a, old_b, new_c])
+        # Previously published rows are kept exactly as they were.
+        self.assertEqual(rows[0]["title"], "A")
+        with self.assertRaises(manifest.ManifestBuilderError):
+            manifest.append_only_manifest(b"", [record(new_c, "C")])
+
     def test_missing_sidecar_is_quarantined_outside_authoritative_gate(self):
         missing_children = {
             PNG_ROOT_ID: [self.folder(self.FOLDER_A, "Missing")],

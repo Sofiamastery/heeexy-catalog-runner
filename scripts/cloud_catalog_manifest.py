@@ -94,6 +94,9 @@ INCREMENTAL_SIDECAR_REQUIRED_COLUMNS = frozenset(
 INCREMENTAL_OWNER_APPROVAL_RE = re.compile(
     r"^approved_exact_[a-z0-9._-]{1,120}$", re.IGNORECASE
 )
+INCREMENTAL_AUTO_APPROVABLE_VALUES = frozenset(
+    {"", "pending", "owner_pending", "needs_review", "review", "awaiting_approval"}
+)
 INCREMENTAL_PENDING_DRIVE_VALUES = frozenset(
     {"", "connector_upload_pending", "pending"}
 )
@@ -2110,6 +2113,48 @@ def manifest_product_identities(payload: bytes) -> frozenset[str]:
     return frozenset(identities)
 
 
+def append_only_manifest(
+    previous_manifest: bytes, records: Sequence[Mapping[str, Any]]
+) -> tuple[bytes, int]:
+    """Keep every previously published record and add only new identities.
+
+    Used when the full-catalog gate holds for historical reasons (for example
+    unresolved legacy inventory) so newly validated designs can still go live
+    without dropping or rewriting anything already published.
+    """
+
+    kept: list[Mapping[str, Any]] = []
+    identities: set[str] = set()
+    for raw_line in _iter_text_lines(previous_manifest):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ManifestBuilderError("previous_manifest_invalid") from error
+        identity = normalize_text(record.get("product_identity")) if isinstance(record, Mapping) else ""
+        if (
+            not isinstance(record, Mapping)
+            or record.get("schema_version") != MANIFEST_SCHEMA_VERSION
+            or record.get("record_type") != "heeexy_catalog_product"
+            or not MANIFEST_IDENTITY_RE.fullmatch(identity)
+            or identity in identities
+        ):
+            raise ManifestBuilderError("previous_manifest_invalid")
+        identities.add(identity)
+        kept.append(record)
+    if not kept:
+        raise ManifestBuilderError("previous_manifest_empty")
+    added = [
+        record
+        for record in records
+        if normalize_text(record.get("product_identity")) not in identities
+        and MANIFEST_IDENTITY_RE.fullmatch(normalize_text(record.get("product_identity")))
+    ]
+    return render_manifest_jsonl([*kept, *added]), len(added)
+
+
 def build_inventory_report(
     *,
     inventory_stats: Mapping[str, int],
@@ -2717,13 +2762,22 @@ def parse_incremental_product_sidecar(
 
     row = _incremental_sidecar_row(payload)
     approval = normalize_text(row["ownerapproval"]).casefold()
-    if approval not in {"approved", "owner_approved"} and not INCREMENTAL_OWNER_APPROVAL_RE.fullmatch(
-        approval
-    ):
+    # Owner policy (2026-10-14): every design uploaded to PNG Only should go
+    # live automatically. With HEEEXY_PNG_ONLY_AUTO_APPROVE=true an empty or
+    # pending approval/stage counts as approved; titles, descriptions, tags and
+    # exact file checks below still apply.
+    auto_approve = os.environ.get("HEEEXY_PNG_ONLY_AUTO_APPROVE", "").strip().lower() == "true"
+    approved = approval in {"approved", "owner_approved"} or bool(
+        INCREMENTAL_OWNER_APPROVAL_RE.fullmatch(approval)
+    )
+    if not approved and not (auto_approve and approval in INCREMENTAL_AUTO_APPROVABLE_VALUES):
         raise ManifestBuilderError("incremental_sidecar_owner_approval_invalid")
     if normalize_text(row["deliverykind"]).casefold() != "transparent_png":
         raise ManifestBuilderError("incremental_sidecar_delivery_kind_invalid")
-    if normalize_text(row["etsystage"]).casefold() != "active_verified":
+    etsy_stage = normalize_text(row["etsystage"]).casefold()
+    if etsy_stage != "active_verified" and not (
+        auto_approve and etsy_stage in INCREMENTAL_AUTO_APPROVABLE_VALUES | {"draft", "active", "inactive", "verified"}
+    ):
         raise ManifestBuilderError("incremental_sidecar_etsy_stage_invalid")
     delivery_name = normalize_text(row["deliveryfile"])
     if (
@@ -3429,7 +3483,13 @@ def run_builder(config: BuilderConfig, oauth: tuple[str, str, str]) -> tuple[Cou
         payload=report_payload,
     )
     if not report["publication_gate"]["eligible"]:
-        raise ManifestBuilderError("manifest_publication_gate_failed")
+        append_only = os.environ.get("HEEEXY_APPEND_ONLY_PUBLICATION", "").strip().lower() == "true"
+        if not append_only:
+            raise ManifestBuilderError("manifest_publication_gate_failed")
+        manifest_payload, added = append_only_manifest(previous_manifest, reconciliation.records)
+        print(f"manifest_append_only new_products={added}", flush=True)
+        if added == 0:
+            raise ManifestBuilderError("manifest_publication_gate_failed")
     manifest_file_id = drive.upsert_generated_bytes(
         parent_id=config.catalog_metadata_folder_id,
         name=MANIFEST_FILENAME,

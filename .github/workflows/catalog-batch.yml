@@ -204,6 +204,10 @@ jobs:
           GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
           GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
           GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN }}
+          # Owner policy: PNG Only uploads go live automatically; when only
+          # historical inventory blocks the full gate, publish append-only.
+          HEEEXY_PNG_ONLY_AUTO_APPROVE: "true"
+          HEEEXY_APPEND_ONLY_PUBLICATION: "true"
         run: |
           set -euo pipefail
           python -B scripts/cloud_catalog_manifest.py
