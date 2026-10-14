@@ -108,12 +108,14 @@ jobs:
           fi
           if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$SCHEDULE_ENABLED" != "true" ]]; then
             echo "Scheduled catalog processing is disabled."
-            echo "workflow_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "workflow_enabled=disabled" >> "$GITHUB_OUTPUT"
             echo "should_rebuild=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "workflow_enabled=true" >> "$GITHUB_OUTPUT"
+          # Not "true": GitHub drops job outputs equal to a secret value
+          # (SCHEDULE_ENABLED is "true"), which silently skipped ingest.
+          echo "workflow_enabled=enabled" >> "$GITHUB_OUTPUT"
           should_rebuild="false"
           if [[ "$GITHUB_EVENT_NAME" == "schedule" || "${{ inputs.rebuild_manifest }}" == "true" ]]; then
             should_rebuild="true"
@@ -231,7 +233,7 @@ jobs:
     needs: manifest
     if: >-
       ${{ needs.manifest.result == 'success' &&
-          needs.manifest.outputs.workflow_enabled == 'true' &&
+          needs.manifest.outputs.workflow_enabled == 'enabled' &&
           github.ref == 'refs/heads/main' &&
           (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
     runs-on: ubuntu-24.04
@@ -417,7 +419,7 @@ jobs:
           github.ref == 'refs/heads/main' &&
           inputs.drain_catalog == true &&
           needs.ingest.result == 'success' &&
-          needs.ingest.outputs.batch_full == 'true' }}
+          needs.ingest.outputs.batch_full == 'yes' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

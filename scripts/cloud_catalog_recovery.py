@@ -434,7 +434,8 @@ def main():
             output_path = env.get("GITHUB_OUTPUT")
             if output_path:
                 with open(output_path, "a", encoding="utf-8") as output:
-                    output.write("work_available=" + str(available).lower() + "\n")
+                    # "yes"/"no", not "true": GitHub drops job outputs equal to a secret value.
+                    output.write("work_available=" + ("yes" if available else "no") + "\n")
         print("catalog_recovery_status=ok", flush=True)
     except Exception as error:
         code = getattr(error, "code", "unexpected_failure")

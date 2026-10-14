@@ -137,7 +137,7 @@ class CloudCatalogBatchSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 output_file.read_text(encoding="utf-8"),
-                "selected=3\nbatch_size=3\nbatch_full=true\n",
+                "selected=3\nbatch_size=3\nbatch_full=yes\n",
             )
 
 
@@ -151,7 +151,7 @@ class CloudCatalogWorkflowStaticTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("drain_catalog:", workflow)
         self.assertIn("default: false", workflow)
-        self.assertIn("needs.ingest.outputs.batch_full == 'true'", workflow)
+        self.assertIn("needs.ingest.outputs.batch_full == 'yes'", workflow)
         self.assertIn("actions: write", workflow)
         self.assertIn("SAFE_BATCH_SIZE: ${{ inputs.batch_size }}", workflow)
         self.assertNotIn("needs.ingest.outputs.batch_size", workflow)

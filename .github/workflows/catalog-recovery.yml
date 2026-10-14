@@ -89,7 +89,7 @@ jobs:
     needs: recover
     if: >-
       ${{ (github.event_name == 'schedule' || (inputs.publish == true && inputs.start_drain == true)) &&
-          needs.recover.result == 'success' && needs.recover.outputs.work_available == 'true' }}
+          needs.recover.result == 'success' && needs.recover.outputs.work_available == 'yes' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

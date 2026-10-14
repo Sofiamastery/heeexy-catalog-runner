@@ -89,7 +89,8 @@ def write_github_outputs(path: Path, selected: int, batch_size: int, batch_full:
     with path.open("a", encoding="utf-8", newline="\n") as output:
         output.write(f"selected={selected}\n")
         output.write(f"batch_size={batch_size}\n")
-        output.write(f"batch_full={'true' if batch_full else 'false'}\n")
+        # "yes"/"no", not "true": GitHub drops job outputs equal to a secret value.
+        output.write(f"batch_full={'yes' if batch_full else 'no'}\n")
 
 
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:

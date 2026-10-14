@@ -129,7 +129,7 @@ class PublicRepositorySafetyTests(unittest.TestCase):
         self.assertIn("secrets.EXPECTED_REPOSITORY", workflow)
         self.assertIn('GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY', workflow)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
-        self.assertIn("needs.ingest.outputs.batch_full == 'true'", workflow)
+        self.assertIn("needs.ingest.outputs.batch_full == 'yes'", workflow)
         self.assertIn("actions: write", workflow)
         self.assertIn("SAFE_BATCH_SIZE", workflow)
         self.assertIn('ACTIONS_RETENTION_DAYS" != "1', workflow)
