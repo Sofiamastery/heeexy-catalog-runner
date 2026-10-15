@@ -1758,6 +1758,46 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
         finally:
             os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
 
+    def test_studio_json_metadata_sidecar_publishes_under_auto_approve(self):
+        import os
+        payload = json.dumps({
+            "id": "LC023",
+            "filename": "New Design.png",
+            "canonical_png": "New Design.png",
+            "dimensions": "3000x3000",
+            "etsy_state": "not_uploaded",
+            "release_status": "prepared_for_authorized_release",
+            "etsy_title": "Safari Birthday 10 Bow Charm PNG, Jungle Animal Birthday Clipart, Transparent Sublimation Digital Download",
+            "etsy_description": "Original Safari Birthday 10 bow-charm artwork with coordinated topic-specific charms, long layered ribbon tails and a polished glossy finish for shirts and gifts.",
+            "etsy_tags": "safari birthday 10, safari birthday, birthday bow png, jungle birthday, bow charm png, transparent png",
+        }).encode()
+        sidecar = {
+            "id": self.SIDECAR_A,
+            "name": "New Design_metadata.json",
+            "mimeType": "application/json",
+            "size": str(len(payload)),
+            "parents": [self.FOLDER_A],
+        }
+        children = {
+            PNG_ROOT_ID: [self.folder(self.FOLDER_A, "LC023_safari_birthday_10")],
+            self.FOLDER_A: [self.png(self.PNG_A, "New Design.png", self.FOLDER_A), sidecar],
+        }
+        os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+        _, _, seeds, stats = self.scan(children, {self.SIDECAR_A: (payload, sidecar)})
+        self.assertEqual(seeds, [])
+        self.assertEqual(stats["quarantine_incremental_sidecar_missing"], 1)
+        os.environ["HEEEXY_PNG_ONLY_AUTO_APPROVE"] = "true"
+        try:
+            _, assets, seeds, stats = self.scan(children, {self.SIDECAR_A: (payload, sidecar)})
+            self.assertEqual(len(seeds), 1)
+            self.assertEqual(seeds[0].hold_reasons, ())
+            self.assertEqual(stats["json_sidecars_discovered"], 1)
+            reconciled, _ = reconcile_seed_catalog(seeds, assets, "heeexy-store")
+            self.assertEqual(len(reconciled.records), 1)
+            self.assertTrue(reconciled.records[0]["metadata"]["title"].startswith("Safari Birthday 10"))
+        finally:
+            os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+
     def test_append_only_manifest_keeps_previous_records_and_adds_new_ones(self):
         def record(identity, title):
             return {

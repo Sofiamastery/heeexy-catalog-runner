@@ -105,6 +105,65 @@ INCREMENTAL_AUTO_APPROVE_REQUIRED_COLUMNS = frozenset(
 )
 
 
+# The design studio now writes one "<design>_metadata.json" next to each PNG
+# instead of the CSV sidecar. It carries the same Etsy fields under other names.
+INCREMENTAL_JSON_SIDECAR_SUFFIX = "_metadata.json"
+INCREMENTAL_JSON_SIDECAR_MIMES = frozenset(
+    {"application/json", "text/json", "text/plain", "application/octet-stream"}
+)
+
+
+def is_incremental_sidecar_name(name: str) -> bool:
+    lowered = normalize_text(name).casefold()
+    return lowered == pipeline.METADATA_FILENAME.casefold() or (
+        lowered.endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX) and len(lowered) > len(INCREMENTAL_JSON_SIDECAR_SUFFIX)
+    )
+
+
+def _incremental_json_sidecar_row(payload: bytes) -> dict[str, str]:
+    """Map the studio's JSON metadata onto the CSV sidecar's column names."""
+
+    if not payload or len(payload) > MAX_INCREMENTAL_SIDECAR_BYTES:
+        raise ManifestBuilderError("incremental_sidecar_size_invalid")
+    try:
+        data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ManifestBuilderError("incremental_sidecar_json_invalid") from error
+    if not isinstance(data, Mapping):
+        raise ManifestBuilderError("incremental_sidecar_json_invalid")
+
+    def text(*keys: str) -> str:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                value = ", ".join(str(item) for item in value)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return unicodedata.normalize("NFKC", str(value)).strip()
+        return ""
+
+    width, height = "", ""
+    dimensions = text("dimensions")
+    match = re.fullmatch(r"\s*(\d{1,5})\s*[x×]\s*(\d{1,5})\s*", dimensions)
+    if match:
+        width, height = match.group(1), match.group(2)
+    row = {
+        "deliveryfile": text("canonical_png", "filename"),
+        "deliverykind": "transparent_png",
+        "ownerapproval": text("owner_approval", "release_status"),
+        "etsystage": text("etsy_stage", "etsy_state"),
+        "etsytitle": text("etsy_title", "title"),
+        "etsydescription": text("etsy_description", "description"),
+        "etsytags": text("etsy_tags", "tags", "keywords"),
+        "topic": text("topic", "category"),
+        "png_sha256": text("canonical_sha256", "sha256"),
+        "width": width,
+        "height": height,
+    }
+    if not all(row[key] for key in INCREMENTAL_AUTO_APPROVE_REQUIRED_COLUMNS):
+        raise ManifestBuilderError("incremental_sidecar_contract_columns_missing")
+    return row
+
+
 def _png_only_auto_approve() -> bool:
     return os.environ.get("HEEEXY_PNG_ONLY_AUTO_APPROVE", "").strip().lower() == "true"
 INCREMENTAL_PENDING_DRIVE_VALUES = frozenset(
@@ -2767,15 +2826,23 @@ def parse_incremental_product_sidecar(
 ) -> MetadataEvidence:
     """Validate the reviewed PNG Only sidecar and preserve its Etsy metadata."""
 
-    if normalize_text(sidecar_metadata.get("name")) != pipeline.METADATA_FILENAME:
-        raise ManifestBuilderError("incremental_sidecar_name_invalid")
-    if normalize_text(sidecar_metadata.get("mimeType")) not in INCREMENTAL_SIDECAR_MIMES:
-        raise ManifestBuilderError("incremental_sidecar_mime_invalid")
+    sidecar_name = normalize_text(sidecar_metadata.get("name"))
+    is_json = sidecar_name.casefold().endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX)
+    if is_json:
+        if not _png_only_auto_approve():
+            raise ManifestBuilderError("incremental_sidecar_name_invalid")
+        if normalize_text(sidecar_metadata.get("mimeType")) not in INCREMENTAL_JSON_SIDECAR_MIMES:
+            raise ManifestBuilderError("incremental_sidecar_mime_invalid")
+    else:
+        if sidecar_name != pipeline.METADATA_FILENAME:
+            raise ManifestBuilderError("incremental_sidecar_name_invalid")
+        if normalize_text(sidecar_metadata.get("mimeType")) not in INCREMENTAL_SIDECAR_MIMES:
+            raise ManifestBuilderError("incremental_sidecar_mime_invalid")
     parents = tuple(str(value) for value in sidecar_metadata.get("parents", ()))
     if parents != (folder_id,):
         raise ManifestBuilderError("incremental_sidecar_parent_invalid")
 
-    row = _incremental_sidecar_row(payload)
+    row = _incremental_json_sidecar_row(payload) if is_json else _incremental_sidecar_row(payload)
     for optional in ("ownerapproval", "etsystage", "deliverykind"):
         row.setdefault(optional, "")
     approval = normalize_text(row["ownerapproval"]).casefold()
@@ -3077,9 +3144,13 @@ def scan_png_only_root_and_discover_incremental_seeds(
                     if len(seen_files) > MAX_INVENTORY_ITEMS:
                         raise ManifestBuilderError("source_item_limit")
                     child_name = normalize_text(child.get("name"))
-                    if child_name.casefold() == pipeline.METADATA_FILENAME.casefold():
+                    if child_name.casefold() == pipeline.METADATA_FILENAME.casefold() or (
+                        _png_only_auto_approve() and is_incremental_sidecar_name(child_name)
+                    ):
                         sidecars.append(child)
                         stats["sidecars_discovered"] += 1
+                        if child_name.casefold().endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX):
+                            stats["json_sidecars_discovered"] += 1
                         continue
                     try:
                         item = _asset_from_metadata(
