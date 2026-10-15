@@ -3116,6 +3116,7 @@ def scan_png_only_root_and_discover_incremental_seeds(
             for folder_id, depth in batch:
                 direct_assets: list[DriveAsset] = []
                 sidecars: list[Mapping[str, Any]] = []
+                other_extensions: Counter[str] = Counter()
                 children = sorted(
                     children_by_parent.get(folder_id, []),
                     key=lambda item: (
@@ -3165,6 +3166,8 @@ def scan_png_only_root_and_discover_incremental_seeds(
                         stats[f"{item.extension.lstrip('.')}_files"] += 1
                     else:
                         stats["ignored_non_product_files"] += 1
+                        suffix = PurePosixPath(child_name).suffix.casefold().lstrip(".")
+                        other_extensions[suffix if re.fullmatch(r"[a-z0-9]{1,8}", suffix) else "other"] += 1
 
                 product_assets = tuple(
                     asset
@@ -3213,6 +3216,13 @@ def scan_png_only_root_and_discover_incremental_seeds(
                     stats["quarantined_direct_candidate_folders"] += 1
                     for reason in sorted(set(quarantine_reasons)):
                         stats[f"quarantine_{reason}"] += 1
+                    # Aggregate shape of held folders (no names): explains what
+                    # the studio uploaded so the contract can follow it.
+                    stats[f"quarantine_shape_png_{min(len(pngs), 9)}"] += 1
+                    stats[f"quarantine_shape_svg_{min(len(svgs), 9)}"] += 1
+                    for suffix, count in other_extensions.items():
+                        stats[f"quarantine_other_{suffix}_files"] += count
+                        stats[f"quarantine_folders_with_{suffix}"] += 1
                     continue
 
                 seed, folder_stats, read_count = _incremental_seed_for_folder(
