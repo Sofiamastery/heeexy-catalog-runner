@@ -1831,6 +1831,33 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
         finally:
             os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
 
+    def test_two_different_pngs_use_the_png_named_by_the_sidecar(self):
+        import os
+        payload = incremental_sidecar_bytes(
+            PNG_SHA256="a" * 64,
+            DriveProductFolderID=self.FOLDER_A,
+            DrivePNGFileID=self.PNG_A,
+        )
+        sidecar = self.sidecar(self.SIDECAR_A, self.FOLDER_A, payload)
+        mockup = dict(self.png(self.SVG_A, "Listing Mockup.png", self.FOLDER_A), size="999")
+        children = {
+            PNG_ROOT_ID: [self.folder(self.FOLDER_A, "New Product")],
+            self.FOLDER_A: [self.png(self.PNG_A, "New Design.png", self.FOLDER_A), mockup, sidecar],
+        }
+        os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+        _, _, seeds, stats = self.scan(children, {self.SIDECAR_A: (payload, sidecar)})
+        self.assertEqual(seeds, [])
+        self.assertEqual(stats["quarantine_incremental_png_identity_ambiguous"], 1)
+        os.environ["HEEEXY_PNG_ONLY_AUTO_APPROVE"] = "true"
+        try:
+            _, _, seeds, stats = self.scan(children, {self.SIDECAR_A: (payload, sidecar)})
+            self.assertEqual(len(seeds), 1, stats)
+            self.assertEqual(seeds[0].png_file_ids, (self.PNG_A,))
+            self.assertEqual(seeds[0].hold_reasons, ())
+            self.assertEqual(stats["delivery_png_selected_by_sidecar"], 1)
+        finally:
+            os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+
     def test_append_only_manifest_keeps_previous_records_and_adds_new_ones(self):
         def record(identity, title):
             return {

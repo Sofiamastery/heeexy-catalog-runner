@@ -221,6 +221,28 @@ _NESTED_PNG_IDS_BY_FOLDER: dict[str, list[str]] = {}
 _NESTED_FOLDERS_WITH_METADATA: set[str] = set()
 
 
+def _sidecar_delivery_png(
+    drive: "ManifestDriveClient", sidecar: Mapping[str, Any], pngs: Sequence["DriveAsset"]
+) -> "DriveAsset | None":
+    """Read a folder's single sidecar and return the PNG it names, if exactly one."""
+    sidecar_id = valid_drive_id(sidecar.get("id"))
+    name = normalize_text(sidecar.get("name")).casefold()
+    if not sidecar_id or name == ETSY_LISTING_SIDECAR_NAME:
+        return None
+    try:
+        payload, _ = drive.download_bytes(sidecar_id, MAX_INCREMENTAL_SIDECAR_BYTES, candidate_scoped=True)
+        row = (
+            _incremental_json_sidecar_row(payload)
+            if name.endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX)
+            else _incremental_sidecar_row(payload)
+        )
+    except ManifestBuilderError:
+        return None
+    wanted = normalize_text(row.get("deliveryfile"))
+    matches = [asset for asset in pngs if asset.name == wanted]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _identical_png_copies(pngs: Sequence["DriveAsset"]) -> bool:
     """True when several PNGs are the same file saved under spacing variants."""
     names = {asset.basename_normalized for asset in pngs}
@@ -3284,6 +3306,13 @@ def scan_png_only_root_and_discover_incremental_seeds(
                 svgs = tuple(
                     asset for asset in product_assets if asset.extension == ".svg"
                 )
+                if _png_only_auto_approve() and len(pngs) > 1 and len(sidecars) == 1 and not _identical_png_copies(pngs):
+                    chosen = _sidecar_delivery_png(drive, sidecars[0], pngs)
+                    if chosen is not None:
+                        dropped = {asset.file_id for asset in pngs if asset.file_id != chosen.file_id}
+                        direct_assets = [asset for asset in direct_assets if asset.file_id not in dropped]
+                        pngs = (chosen,)
+                        stats["delivery_png_selected_by_sidecar"] += 1
                 if _png_only_auto_approve() and len(pngs) > 1 and _identical_png_copies(pngs):
                     keep = sorted(pngs, key=lambda item: (item.name, item.file_id))[0]
                     dropped = {asset.file_id for asset in pngs if asset.file_id != keep.file_id}
@@ -3681,6 +3710,26 @@ def run_builder(config: BuilderConfig, oauth: tuple[str, str, str]) -> tuple[Cou
                 value = valid_drive_id(record_assets.get(key))
                 if value:
                     referenced_ids.add(value)
+        checksum_by_id = {
+            asset.file_id: (asset.md5_checksum or asset.sha256_checksum)
+            for asset in assets
+            if asset.md5_checksum or asset.sha256_checksum
+        }
+        referenced_checksums = {checksum_by_id[file_id] for file_id in referenced_ids if file_id in checksum_by_id}
+        name_by_id = {asset.file_id: asset.basename_normalized for asset in assets}
+        referenced_names = {name_by_id[file_id] for file_id in referenced_ids if file_id in name_by_id}
+        for folder_id, png_ids in _NESTED_PNG_IDS_BY_FOLDER.items():
+            for png_id in png_ids:
+                if png_id in referenced_ids:
+                    continue
+                if checksum_by_id.get(png_id) and checksum_by_id[png_id] in referenced_checksums:
+                    inventory_stats["png_only_nested_unpublished_same_bytes_as_published"] += 1
+                elif name_by_id.get(png_id) in referenced_names:
+                    inventory_stats["png_only_nested_unpublished_same_name_as_published"] += 1
+                else:
+                    inventory_stats["png_only_nested_truly_new_png"] += 1
+                    if folder_id in _NESTED_FOLDERS_WITH_METADATA:
+                        inventory_stats["png_only_nested_truly_new_png_with_metadata"] += 1
         for folder_id, png_ids in _NESTED_PNG_IDS_BY_FOLDER.items():
             missing = [png_id for png_id in png_ids if png_id not in referenced_ids]
             inventory_stats["png_only_nested_png_files"] += len(png_ids)
