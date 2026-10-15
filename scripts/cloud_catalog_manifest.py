@@ -215,6 +215,12 @@ def _name_tail(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", f"{tail[:12]}_{extension[:6]}") or "x"
 
 
+# Nested PNG Only folders (depth > 1) found by the last scan: folder -> PNG ids,
+# and whether the folder carries any metadata-like file. Diagnostics only.
+_NESTED_PNG_IDS_BY_FOLDER: dict[str, list[str]] = {}
+_NESTED_FOLDERS_WITH_METADATA: set[str] = set()
+
+
 def _identical_png_copies(pngs: Sequence["DriveAsset"]) -> bool:
     """True when several PNGs are the same file saved under spacing variants."""
     names = {asset.basename_normalized for asset in pngs}
@@ -3158,6 +3164,8 @@ def scan_png_only_root_and_discover_incremental_seeds(
     root = drive.get_metadata(root_id)
     if root.get("trashed") or root.get("mimeType") != FOLDER_MIME:
         raise ManifestBuilderError("source_root_invalid")
+    _NESTED_PNG_IDS_BY_FOLDER.clear()
+    _NESTED_FOLDERS_WITH_METADATA.clear()
     assets: list[DriveAsset] = []
     seeds: list[ProductSeed] = []
     stats: Counter[str] = Counter()
@@ -3245,6 +3253,12 @@ def scan_png_only_root_and_discover_incremental_seeds(
                     for asset in direct_assets
                     if asset.extension in {".png", ".svg"}
                 )
+                if depth > 1:
+                    nested_pngs = [asset.file_id for asset in product_assets if asset.extension == ".png"]
+                    if nested_pngs:
+                        _NESTED_PNG_IDS_BY_FOLDER[folder_id] = nested_pngs
+                        if sidecars or other_extensions.get("csv") or other_extensions.get("json"):
+                            _NESTED_FOLDERS_WITH_METADATA.add(folder_id)
                 if depth != 1:
                     if product_assets or sidecars:
                         stats["coverage_non_direct_candidate_folders"] += 1
@@ -3296,6 +3310,21 @@ def scan_png_only_root_and_discover_incremental_seeds(
                     # Aggregate shape of held folders (no names): explains what
                     # the studio uploaded so the contract can follow it.
                     stats[f"quarantine_shape_png_{min(len(pngs), 9)}"] += 1
+                    if len(pngs) > 1:
+                        stats[f"ambiguous_sidecars_{min(len(sidecars), 9)}"] += 1
+                        stats[f"ambiguous_distinct_names_{min(len({p.basename_normalized for p in pngs}), 9)}"] += 1
+                        json_sidecars = sum(
+                            1 for item in sidecars
+                            if normalize_text(item.get("name")).casefold().endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX)
+                        )
+                        stats[f"ambiguous_json_sidecars_{min(json_sidecars, 9)}"] += 1
+                        json_stems = {
+                            normalize_basename(normalize_text(item.get("name"))[: -len(INCREMENTAL_JSON_SIDECAR_SUFFIX)])
+                            for item in sidecars
+                            if normalize_text(item.get("name")).casefold().endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX)
+                        }
+                        if json_stems and all(p.basename_normalized in json_stems for p in pngs):
+                            stats["ambiguous_each_png_has_own_json"] += 1
                     for png in pngs:
                         stats["quarantine_png_name_" + _name_tail(png.name)] += 1
                     stats[f"quarantine_shape_svg_{min(len(svgs), 9)}"] += 1
@@ -3631,6 +3660,35 @@ def run_builder(config: BuilderConfig, oauth: tuple[str, str, str]) -> tuple[Cou
         raise ManifestBuilderError("generated_output_expected_missing")
     try:
         previous_identities = manifest_product_identities(previous_manifest)
+        referenced_ids: set[str] = set(pinned_source_ids)
+        for raw_line in _iter_text_lines(previous_manifest):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                previous_record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record_assets = previous_record.get("assets") if isinstance(previous_record, Mapping) else None
+            if isinstance(record_assets, Mapping):
+                for key in ("png_drive_file_id", "svg_drive_file_id", "archive_drive_file_id"):
+                    value = valid_drive_id(record_assets.get(key))
+                    if value:
+                        referenced_ids.add(value)
+        for record in reconciliation.records:
+            record_assets = record.get("assets") if isinstance(record.get("assets"), Mapping) else {}
+            for key in ("png_drive_file_id", "svg_drive_file_id", "archive_drive_file_id"):
+                value = valid_drive_id(record_assets.get(key))
+                if value:
+                    referenced_ids.add(value)
+        for folder_id, png_ids in _NESTED_PNG_IDS_BY_FOLDER.items():
+            missing = [png_id for png_id in png_ids if png_id not in referenced_ids]
+            inventory_stats["png_only_nested_png_files"] += len(png_ids)
+            inventory_stats["png_only_nested_png_unpublished"] += len(missing)
+            if missing:
+                inventory_stats["png_only_nested_folders_with_unpublished_png"] += 1
+                if folder_id in _NESTED_FOLDERS_WITH_METADATA:
+                    inventory_stats["png_only_nested_unpublished_folders_with_metadata"] += 1
     except ManifestBuilderError:
         inventory_stats["blocking_previous_manifest_invalid"] += 1
     else:
