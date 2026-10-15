@@ -3774,7 +3774,10 @@ def run_builder(config: BuilderConfig, oauth: tuple[str, str, str]) -> tuple[Cou
         manifest_payload, added = append_only_manifest(previous_manifest, reconciliation.records)
         print(f"manifest_append_only new_products={added}", flush=True)
         if added == 0:
-            raise ManifestBuilderError("manifest_publication_gate_failed")
+            # Nothing new to add: keep the published manifest as it is. This is
+            # the normal state between uploads, not a failure.
+            print("manifest_append_only status=unchanged", flush=True)
+            return (Counter(manifest_unchanged=1), config.catalog_manifest_drive_file_id)
     manifest_file_id = drive.upsert_generated_bytes(
         parent_id=config.catalog_metadata_folder_id,
         name=MANIFEST_FILENAME,
