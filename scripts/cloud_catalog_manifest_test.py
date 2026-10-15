@@ -1798,6 +1798,39 @@ class IncrementalPngOnlySidecarTests(unittest.TestCase):
         finally:
             os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
 
+    def test_etsy_bundle_folder_with_duplicate_png_copy_publishes_once(self):
+        import os
+        listing = (
+            "Title,Description,Category,Tags\r\n"
+            "\"Wee Woo Wife Firefighter bundle 01\",\"Wee Woo Wife Firefighter bundle 01, a high quality PNG sublimation design for t-shirts, hoodies, mugs and tote bags. Transparent background, 300 DPI.\",Graphics,\"firefighter wife, wee woo, firefighter png, sublimation png, wife shirt, transparent png\"\r\n"
+        ).encode()
+        sidecar = {
+            "id": self.SIDECAR_A,
+            "name": "etsy_ready_listing.csv",
+            "mimeType": "text/csv",
+            "size": str(len(listing)),
+            "parents": [self.FOLDER_A],
+        }
+        keywords = {"id": "1" + "k" * 27, "name": "optimized_keywords.csv", "mimeType": "text/csv", "size": "20", "parents": [self.FOLDER_A]}
+        png_a = self.png(self.PNG_A, "Wee_Woo_Wife_Firefighter_bundle_01.png", self.FOLDER_A)
+        png_b = dict(self.png(self.SVG_A, "Wee Woo Wife Firefighter bundle 01.png", self.FOLDER_A))
+        children = {
+            PNG_ROOT_ID: [self.folder(self.FOLDER_A, "Wee Woo Wife Firefighter bundle 01")],
+            self.FOLDER_A: [png_a, png_b, sidecar, keywords],
+        }
+        os.environ["HEEEXY_PNG_ONLY_AUTO_APPROVE"] = "true"
+        try:
+            _, assets, seeds, stats = self.scan(children, {self.SIDECAR_A: (listing, sidecar)})
+            self.assertEqual(len(seeds), 1, stats)
+            self.assertEqual(seeds[0].hold_reasons, ())
+            self.assertEqual(len(seeds[0].png_file_ids), 1)
+            self.assertEqual(stats["duplicate_png_copies_merged"], 1)
+            reconciled, _ = reconcile_seed_catalog(seeds, assets, "heeexy-store")
+            self.assertEqual(len(reconciled.records), 1)
+            self.assertIn("Firefighter", reconciled.records[0]["metadata"]["title"])
+        finally:
+            os.environ.pop("HEEEXY_PNG_ONLY_AUTO_APPROVE", None)
+
     def test_append_only_manifest_keeps_previous_records_and_adds_new_ones(self):
         def record(identity, title):
             return {

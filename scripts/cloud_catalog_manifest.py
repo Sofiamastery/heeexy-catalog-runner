@@ -113,11 +113,53 @@ INCREMENTAL_JSON_SIDECAR_MIMES = frozenset(
 )
 
 
+# Older Etsy-bundle folders carry Etsy's bulk-listing export instead.
+ETSY_LISTING_SIDECAR_NAME = "etsy_ready_listing.csv"
+
+
 def is_incremental_sidecar_name(name: str) -> bool:
     lowered = normalize_text(name).casefold()
-    return lowered == pipeline.METADATA_FILENAME.casefold() or (
+    return lowered in {pipeline.METADATA_FILENAME.casefold(), ETSY_LISTING_SIDECAR_NAME} or (
         lowered.endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX) and len(lowered) > len(INCREMENTAL_JSON_SIDECAR_SUFFIX)
     )
+
+
+def _etsy_listing_sidecar_row(payload: bytes, delivery_file: str) -> dict[str, str]:
+    """Map one Etsy bulk-listing row (Title, Description, Tags, Category)."""
+
+    if not payload or len(payload) > MAX_INCREMENTAL_SIDECAR_BYTES:
+        raise ManifestBuilderError("incremental_sidecar_size_invalid")
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeError as error:
+        raise ManifestBuilderError("incremental_sidecar_encoding_invalid") from error
+    first_line = text.split("\n", 1)[0]
+    delimiter = "\t" if first_line.count("\t") > first_line.count(",") else ","
+    try:
+        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
+        rows = [
+            {normalize_text(key).casefold(): unicodedata.normalize("NFKC", str(value or "")).strip() for key, value in raw.items() if key}
+            for raw in reader
+        ]
+    except csv.Error as error:
+        raise ManifestBuilderError("incremental_sidecar_csv_invalid") from error
+    rows = [row for row in rows if any(row.values())]
+    if len(rows) != 1:
+        raise ManifestBuilderError("incremental_sidecar_row_count")
+    row = rows[0]
+    mapped = {
+        "deliveryfile": delivery_file,
+        "deliverykind": "transparent_png",
+        "ownerapproval": "",
+        "etsystage": "",
+        "etsytitle": row.get("title", ""),
+        "etsydescription": row.get("description", ""),
+        "etsytags": row.get("tags", ""),
+        "topic": row.get("category", ""),
+    }
+    if not all(mapped[key] for key in INCREMENTAL_AUTO_APPROVE_REQUIRED_COLUMNS):
+        raise ManifestBuilderError("incremental_sidecar_contract_columns_missing")
+    return mapped
 
 
 def _incremental_json_sidecar_row(payload: bytes) -> dict[str, str]:
@@ -171,6 +213,14 @@ def _name_tail(name: str) -> str:
     words = [word for word in re.split(r"[^a-z]+", stem) if word]
     tail = words[-1] if words else "x"
     return re.sub(r"[^a-z0-9]", "", f"{tail[:12]}_{extension[:6]}") or "x"
+
+
+def _identical_png_copies(pngs: Sequence["DriveAsset"]) -> bool:
+    """True when several PNGs are the same file saved under spacing variants."""
+    names = {asset.basename_normalized for asset in pngs}
+    sizes = {asset.size_bytes for asset in pngs}
+    checksums = {asset.md5_checksum for asset in pngs if asset.md5_checksum}
+    return len(names) == 1 and len(sizes) == 1 and len(checksums) <= 1
 
 
 def _png_only_auto_approve() -> bool:
@@ -2837,7 +2887,13 @@ def parse_incremental_product_sidecar(
 
     sidecar_name = normalize_text(sidecar_metadata.get("name"))
     is_json = sidecar_name.casefold().endswith(INCREMENTAL_JSON_SIDECAR_SUFFIX)
-    if is_json:
+    is_etsy_listing = sidecar_name.casefold() == ETSY_LISTING_SIDECAR_NAME
+    if is_etsy_listing:
+        if not _png_only_auto_approve():
+            raise ManifestBuilderError("incremental_sidecar_name_invalid")
+        if normalize_text(sidecar_metadata.get("mimeType")) not in INCREMENTAL_SIDECAR_MIMES | {"text/plain", "text/tab-separated-values"}:
+            raise ManifestBuilderError("incremental_sidecar_mime_invalid")
+    elif is_json:
         if not _png_only_auto_approve():
             raise ManifestBuilderError("incremental_sidecar_name_invalid")
         if normalize_text(sidecar_metadata.get("mimeType")) not in INCREMENTAL_JSON_SIDECAR_MIMES:
@@ -2851,7 +2907,12 @@ def parse_incremental_product_sidecar(
     if parents != (folder_id,):
         raise ManifestBuilderError("incremental_sidecar_parent_invalid")
 
-    row = _incremental_json_sidecar_row(payload) if is_json else _incremental_sidecar_row(payload)
+    if is_etsy_listing:
+        row = _etsy_listing_sidecar_row(payload, png_asset.name)
+    elif is_json:
+        row = _incremental_json_sidecar_row(payload)
+    else:
+        row = _incremental_sidecar_row(payload)
     for optional in ("ownerapproval", "etsystage", "deliverykind"):
         row.setdefault(optional, "")
     approval = normalize_text(row["ownerapproval"]).casefold()
@@ -3209,6 +3270,12 @@ def scan_png_only_root_and_discover_incremental_seeds(
                 svgs = tuple(
                     asset for asset in product_assets if asset.extension == ".svg"
                 )
+                if _png_only_auto_approve() and len(pngs) > 1 and _identical_png_copies(pngs):
+                    keep = sorted(pngs, key=lambda item: (item.name, item.file_id))[0]
+                    dropped = {asset.file_id for asset in pngs if asset.file_id != keep.file_id}
+                    direct_assets = [asset for asset in direct_assets if asset.file_id not in dropped]
+                    pngs = (keep,)
+                    stats["duplicate_png_copies_merged"] += len(dropped)
                 quarantine_reasons: list[str] = []
                 if not sidecars:
                     quarantine_reasons.append("incremental_sidecar_missing")
