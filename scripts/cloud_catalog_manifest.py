@@ -164,6 +164,15 @@ def _incremental_json_sidecar_row(payload: bytes) -> dict[str, str]:
     return row
 
 
+def _name_tail(name: str) -> str:
+    """Generic naming pattern of a file (its last word + extension), no identity."""
+    lowered = normalize_text(name).casefold()
+    stem, dot, extension = lowered.rpartition(".")
+    words = [word for word in re.split(r"[^a-z]+", stem) if word]
+    tail = words[-1] if words else "x"
+    return re.sub(r"[^a-z0-9]", "", f"{tail[:12]}_{extension[:6]}") or "x"
+
+
 def _png_only_auto_approve() -> bool:
     return os.environ.get("HEEEXY_PNG_ONLY_AUTO_APPROVE", "").strip().lower() == "true"
 INCREMENTAL_PENDING_DRIVE_VALUES = frozenset(
@@ -3168,6 +3177,7 @@ def scan_png_only_root_and_discover_incremental_seeds(
                         stats["ignored_non_product_files"] += 1
                         suffix = PurePosixPath(child_name).suffix.casefold().lstrip(".")
                         other_extensions[suffix if re.fullmatch(r"[a-z0-9]{1,8}", suffix) else "other"] += 1
+                        other_extensions["name_" + _name_tail(child_name)] += 1
 
                 product_assets = tuple(
                     asset
@@ -3219,6 +3229,8 @@ def scan_png_only_root_and_discover_incremental_seeds(
                     # Aggregate shape of held folders (no names): explains what
                     # the studio uploaded so the contract can follow it.
                     stats[f"quarantine_shape_png_{min(len(pngs), 9)}"] += 1
+                    for png in pngs:
+                        stats["quarantine_png_name_" + _name_tail(png.name)] += 1
                     stats[f"quarantine_shape_svg_{min(len(svgs), 9)}"] += 1
                     for suffix, count in other_extensions.items():
                         stats[f"quarantine_other_{suffix}_files"] += count
